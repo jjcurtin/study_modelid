@@ -1,0 +1,525 @@
+---
+title: "Analysis of Random Effects"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+params:
+  version: "v32"
+  algorithm: "glmnet"
+  feature_set: "raw"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+
+
+## Set Up
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+library(brms, exclude = c("populate", "mixture", "ar"))
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/var_score.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+# source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+
+path_shared <- format_path("risk/data_processed/shared")
+path_multilevel <- format_path("risk/data_processed/multilevel")
+path_input <- format_path("optimize/modeling/chtc")
+
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+ids <- read_csv(here::here(path_multilevel, "features_ids.csv")) |> 
+  glimpse()
+coeffs <- read_csv(here::here(format_path("risk/data_processed/multilevel"),
+                                "coeffs_glmer_v2.csv")) |> 
+  glimpse()
+random_effs_multilevel <- read_csv(here::here(format_path("risk/data_processed/multilevel"),
+                                               "random_effects_glmer_v2.csv")) |> 
+  glimpse()
+feat <- read_csv(here::here(path_multilevel, "feat_model.csv")) |> 
+  mutate(lapse = factor(lapse))
+# d <- read_csv(here::here(path_input,
+#                          str_c("train_", params$version, "/input/data_trn.csv")))
+```
+
+```{r}
+ids <- ids |> 
+  filter(subid %in% random_effs_multilevel$subid) |> 
+  glimpse()
+```
+
+## Clean up Data
+
+```{r}
+ids <- ids |> 
+  mutate(
+    demo_sex = if_else(demo_sex == "Male", 1, 0),
+    demo_race = if_else(demo_race == "White/Caucasian", 1, 0),
+    auh_service = if_else(auh_service == "Yes", 1, 0),
+    auh_ndrinks_week = auh_heavy_quant * auh_heavy_freq
+  )
+
+ids <- ids |>
+  mutate(
+    across(
+      -c(demo_sex, demo_race, auh_service),
+      ~ as.numeric(scale(.x))
+    )
+  ) |> 
+  glimpse()
+```
+
+```{r}
+ids |>
+  select(starts_with("auh_")) |>
+  correlate() |>
+  stretch(na.rm = TRUE) |>
+  ggplot(aes(x = x, y = y, fill = r)) +
+  geom_tile() +
+  geom_text(
+    aes(label = sprintf("%.2f", r)),
+    size = 3
+  ) +
+  scale_fill_gradient2(
+    low = "blue",
+    mid = "white",
+    high = "red",
+    midpoint = 0,
+    limits = c(-1, 1)
+  ) +
+  coord_equal() +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "r"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+auh_onset_heavy:	At what age did you first begin drinking regularly-that is drinking at least once a week for 6 months or more?
+
+```{r}
+id_characetrics <- c("demo_age", "demo_sex", "demo_race", "demo_income", 
+         "mps_pem", "mps_nem", "mps_con",
+         "scl90", "dass_anx", "dass_dep", "dass_stress", "mspss",
+         "auh_service", "auh_onset_heavy", "auh_quit_attempts", 
+         "auh_ndrinks_week", "dsm5_total", "pacs", "yap", "aase_total")
+id_labels <- c("age", "sex", "race", "income", "positive emotionality", 
+               "negative emotionality", "constraint", "psychological distress",
+               "anxiety", "depression", "stress/tension", "social support",
+               "use of service",
+               "onset of regular use", "number of quit attempts",
+               "n of drinks per week during heavy drinking",
+               "DSM-5 symptom counts", "cravings", "alcohol problems", 
+               "abstinence self-efficacy")
+features_ids <- ids |>
+  select(subid, all_of(id_characetrics))
+predictors <- names(features_ids |> select(-subid))
+```
+
+```{r}
+outcome_labels <- c(
+  Intercept = "baseline risks",
+  act_type_aa.durraw.p168 = "visits to AA past week",
+  act_type_friend.durraw.p168 = "visits to friends past week",
+  act_type_healthcare.durraw.p168 = "visits to healthcare past week",
+  act_type_restaurant.durraw.p168 = "visits to restaurants past week",
+  act_drank.durraw.p24 = "visits to past drinking past day",
+  act_drank.durraw.p168 = "visits to past drinking past week",
+  act_alcohol.durraw.p168 = "visits to alcohol past week",
+  act_emotion_unpleasant.durraw.p24 = "visits to unpleasant places past day",
+  act_emotion_mixed.durraw.p24 = "visits to mixed emotions places past day",
+  act_emotion_unpleasant.durraw.p168 = "visits to unpleasant places past week",
+  act_risk_high.durraw.p24 = "visits to high-risk places past day",
+  act_risk_medium.durraw.p24 = "visits to medium-risk places past day",
+  act_risk_high.durraw.p168 = "visits to high-risk places past week",
+  act_risk_medium.durraw.p168 = "visits to medium-risk places past week",
+  act_avoid.durraw.p168 = "visits to avoidant places past week",
+  evening_out.durraw.p24 = "evening out past day",
+  location_var.raw.p24 = "location variability past day",
+  location_var.raw.p168 = "location variability past week",
+  normentropy.raw.p168 = "normed entropy",
+  ema_lapse.countraw.p168 = "lapse counts past week",
+  ema_2.recentraw.p0 = "urge to drink",
+  ema_3.recentraw.p0 = "past encounter of risky situations",
+  ema_4.recentraw.p0 = "past stressful events",
+  ema_8.recentraw.p0 = "anticipated risky situations",
+  ema_10.recentraw.p0 = "anticipated drinking",
+  ema_4.medraw.p168 = "medium past stressful events past week",
+  ema_pa.medraw.p168 = "medium positive affect past week",
+  ema_na.medraw.p168 = "medium negative affect past week",
+  ema_8.medraw.p168 = "median anticipated risky situations past week",
+  ema_9.medraw.p168 = "median anticipated stressful events past week",
+  ema_10.medraw.p168 = "median anticipated drinking past week",
+  ema_2.maxraw.p168 = "maximum urge to drink past week",
+  ema_3.maxraw.p168 = "maximum past encounter of risky situations past week",
+  ema_4.maxraw.p168 = "maximum past stressful events past week",
+  ema_8.maxraw.p168 = "maximum anticipated risky situations past week",
+  ema_10.maxraw.p168 = "maximum anticipated drinking past week",
+  ema_1_5.recentraw.p0 = "abstinence goal",
+  ema_1.maxraw.p24 = "drinking past day",
+  ema_lapse.countraw.p48 = "lapse counts past two days",
+  label_day_Fri = "Friday",
+  label_day_Mon = "Monday",
+  label_day_Sat = "Saturday",
+  gps_normentropy.raw.p168 = "normed entropy past week",
+  gps_risk_medium.durraw.p168 = "visits to medium-risk places past week",
+  gps_type_aa.durraw.p168 = "visits to AA past week",
+  gps_type_restaurant.durraw.p168 = "visits to restaurants past week"
+)
+```
+
+## Analysis
+
+### Data
+
+```{r}
+rand_effs_distribution <- random_effs_multilevel |> 
+  select(-subid) |>
+  summarise(
+    across(
+      where(is.numeric),
+      list(
+        mean = ~abs(mean(.x, na.rm = TRUE)),
+        sd = ~sd(.x, na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  ) |>
+  pivot_longer(
+    everything(),
+    names_to = c("variable", ".value"),
+    names_pattern = "(.+)_(mean|sd)$"
+  ) |> 
+  filter(variable != "Intercept") |>
+  mutate(variance = sd ^ 2)
+
+library(ggrepel)
+rand_effs_distribution |> 
+  filter_out(variable == "Intercept") |> 
+  ggplot(aes(x = mean, y = variance)) +
+    geom_point(size = 2.5) +
+    geom_text_repel(aes(label = variable), size = 5) +
+    geom_hline(aes(yintercept = .0025), color = "blue", linetype = "dashed")
+
+plot_box_violin <- function(df, x){
+  
+  df |>
+    ggplot(aes(x = .data[[x]])) +
+    geom_violin(
+      aes(y = 0),
+      fill = "darkorange",
+      color = NA
+    ) +
+    geom_boxplot(
+      width = .1,
+      fill = NA,
+      lwd = 1.1,
+      fatten = 1.1
+    ) +
+    scale_x_continuous(limits = c(-1, 1)) +
+    labs(
+      # x = outcome_labels[[x]],
+      x = stringr::str_wrap(outcome_labels[[x]], width = 25)
+    ) +
+    theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      axis.title.y = element_blank(),
+      axis.title.x = element_text(size = 8),
+      axis.text.x = element_text(
+        size = 6,
+        vjust = 0.5,
+        hjust = 1
+      )
+    )
+}
+
+random_effs_multilevel |> 
+  select(-subid, -Intercept) |> 
+  names() |> 
+  map(\(name) plot_box_violin(df = random_effs_multilevel, x = name)) |> 
+  cowplot::plot_grid(plotlist = _, ncol = 4)
+
+hist(rand_effs_distribution$variance)
+
+rand_effs_distribution |> 
+  left_join(coeffs, by = c("variable" = "term")) |> 
+  mutate(size = sd / abs(multilevel)) |> 
+  ggplot(aes(x = size)) +
+  geom_histogram(bins = 20) 
+
+# regressors <- rand_effs_distribution |> 
+#   filter(sd >= .05) |> 
+#   arrange(desc(sd)) |> 
+#   pull(variable)
+```
+
+**Find high heterogeneous random effects*
+
+```{r}
+# regressors <- rand_effs_distribution |> 
+#   pull(variable)
+
+regressors <- rand_effs_distribution |> 
+  left_join(coeffs, by = c("variable" = "term")) |> 
+  mutate(size = sd / abs(multilevel)) |> 
+  filter(size > 0.25) |> 
+  pull(variable)
+```
+
+**Model Comparison**
+
+
+```{r}
+full_model <- read_rds(
+  here::here(
+    format_path("risk/models/multilevel"),
+    "model_multilevel_glmer_v2.rds"
+  )
+)
+
+model_files <- list.files(
+  path = "~/Desktop/model_save/glmer",
+  pattern = "\\.rds$",
+  full.names = TRUE
+)
+
+results <- map(
+  model_files,
+  \(file) {
+    
+    message("Processing: ", basename(file))
+    
+    compact_model <- read_rds(file)
+
+    anova(full_model, compact_model, test = "LRT") |> 
+      as_tibble() |> 
+      mutate(
+        rand_effect = str_remove(basename(file), ".rds")
+      )
+    
+  }
+) |> 
+  list_rbind()
+```
+
+
+**prepare data**
+
+```{r}
+data <- bind_cols(
+  random_effs_multilevel |> arrange(subid) |> select(-subid),
+  features_ids |> arrange(subid) |>  select(-subid)
+) |> 
+  select(-Intercept) |>
+  glimpse()
+
+regression_params <- expand.grid(
+  outcome = regressors,
+  predictor = predictors
+  ) |>
+  as_tibble() |> 
+  mutate(
+    outcome = as.character(outcome),
+    predictor = as.character(predictor)
+  ) |> 
+  glimpse()
+```
+
+### Model Fitting
+
+```{r}
+regression_tbl_one_pred <- map2(
+  regression_params$outcome,
+  regression_params$predictor,
+  \(outcome, predictor)
+  lm(
+    reformulate(predictor, response = outcome),
+    data = data
+  ) |>
+    (\(model)
+      tidy(model) |>
+        filter(term != "(Intercept)") |>
+        as_tibble() |>
+        rename(predictor = term) |>
+        mutate(
+          outcome = outcome,
+          delta_r2 = statistic^2 /
+            (statistic^2 + df.residual(model)),
+          r = data |>
+            select(all_of(c(outcome, predictor))) |>
+            correlate() |>
+            filter(term == outcome) |>
+            pull(all_of(predictor)),
+          r2 = delta_r2,
+          p_model = glance(model)$p.value
+        ) |>
+        relocate(predictor, outcome, estimate, delta_r2, r2, p_model)
+    )()
+) |>
+  list_rbind() |>
+  mutate(model = "one_predictor")
+
+regression_tbl_multiple <- map(
+  regressors,
+  \(outcome)
+  lm(
+    reformulate(
+      predictors,
+      response = outcome
+    ),
+    data = data
+  ) |>
+    (\(model)
+      tidy(model) |>
+        filter(term != "(Intercept)") |>
+        as_tibble() |>
+        rename(predictor = term) |>
+        mutate(
+          outcome = outcome,
+          delta_r2 = statistic^2 /
+            (statistic^2 + df.residual(model)),
+          r2 = glance(model)$r.squared,
+          p_model = glance(model)$p.value
+        ) |>
+        relocate(predictor, outcome, estimate, delta_r2, r2, p_model)
+    )()
+) |>
+  list_rbind() |>
+  mutate(model = "multiple_predictor")
+```
+
+
+### Results Analysis
+
+
+```{r}
+regression_tbl_one_pred |> 
+  filter(p_model < .05) |> 
+  arrange(desc(delta_r2)) |> 
+  select(outcome, predictor, delta_r2, estimate, p_model) |> 
+  glimpse()
+
+coeffs_high_r2 <- regression_tbl_multiple |> 
+  filter(p_model < .05) |>
+  pull(outcome) |> 
+  unique()
+```
+
+
+
+```{r}
+regression_tbl_one_pred |> 
+  mutate(
+    predictor = factor(
+      predictor,
+      levels = rev(id_characetrics),
+      labels = rev(id_labels)
+    ),
+    
+    # non-significant cells have no heatmap color
+    estimate_sig = if_else(
+      p.value < .05,
+      r,
+      0
+    )
+  ) |> 
+  ggplot(
+    aes(
+      x = outcome,
+      y = predictor,
+      fill = estimate_sig
+    )
+  ) +
+  geom_tile(
+    color = "grey",
+    linewidth = 0.3
+  ) +
+  geom_text(
+    aes(
+      label = if_else(
+        p.value < .05,
+        sprintf("%.2f", r),
+        ""
+      )
+    ),
+    size = 3
+  ) +
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "darkgreen",
+    midpoint = 0,
+    name = "Estimate"
+  ) +
+  scale_x_discrete(
+    labels = outcome_labels
+  ) +
+  labs(
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(
+      angle = 20,
+      hjust = 1
+    ),
+    panel.grid = element_blank(),
+    legend.position = "none"
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

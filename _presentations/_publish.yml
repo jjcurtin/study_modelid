@@ -1,0 +1,4 @@
+- source: talk.qmd
+  quarto-pub:
+    - id: 
+      url: 

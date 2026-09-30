@@ -1,0 +1,702 @@
+---
+title: "Make Demographic and ID variables"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+## Set Up
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/var_score.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+# source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+# path_input <- format_path("optimize/chtc")
+# path_models <- format_path("optimize/data_processed/models")
+# path_features <-  format_path("optimize/data_processed/features")
+path_shared <- format_path("risk/data_processed/shared")
+path_multilevel <- format_path("risk/data_processed/multilevel")
+
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+# ids <- read_csv(here::here(path_shared, "features_aud_id.csv"))
+demographics <- read_csv(here::here(path_shared,
+                                    "features_demographics.csv"))
+intake <- read_csv(here::here(path_shared, "intake.csv"), show_col_types = FALSE) |> 
+  filter(subid %in% demographics$subid)
+screen <- read_csv(here::here(path_shared, "screen.csv"), 
+                   show_col_types = FALSE) |> 
+  filter(subid %in% demographics$subid)
+
+```
+
+## Clean up
+
+### demographics
+
+```{r}
+ids <- demographics |> 
+  select(subid, demo_age, demo_sex, demo_race, demo_income)
+
+```
+
+### AUH - Alcohol Use History
+
+- How old were you when you first believed that you had a drinking problem?
+
+- What types of programs or services have you used in the past to help you quit drinking? Please select all that apply.
+
+- Have you ever taken prescribed medication to help maintain abstinence from alcohol?
+
+- What was the most recent date that you quit drinking alcohol? Please indicate the date after your last drink. (can drop, low variance)
+
+- In the six months prior to your most recent quit date, on average how many days per week did you consume 6 or more alcoholic drinks in one day? (drop)
+
+- In the six months when you drank at your heaviest in your life,  on average how many days per week did you consume 6 or more alcoholic drinks in one day? (drop)
+
+COCO: simplify for treatment program (e.g., outpatient vs. inpatient); can consider drop medication
+
+```{r}
+# ids <- screen |> 
+#   select(subid, "auh_3", starts_with("auh_6")) |> 
+#   rename(auh_onset = auh_3) |> 
+#   mutate(
+#     across(auh_6_1:auh_6_7,
+#     ~ if_else(is.na(.x), "No", "Yes")),
+#     auh_service = if_else(if_any(auh_6_1:auh_6_6, ~ . == "Yes"), "Yes", "No")
+#   ) |> 
+#   select(subid, "auh_onset", "auh_service") |> 
+#   right_join(ids, by = "subid") |> 
+#   relocate(-c("auh_onset", "auh_service")) |> 
+#   glimpse()
+
+ids <- screen |>
+  select(subid, starts_with("auh_"), -starts_with("auh_7"), -starts_with("auh_8")) |>
+  rename(auh_onset_drink = auh_1, auh_onset_heavy = auh_2, 
+         auh_onset_prob = auh_3, auh_quit_age = auh_4, auh_quit_attempts = auh_5,
+         auh_recent_freq = auh_9, auh_recent_severity = auh_10,
+         auh_recent_quant = auh_11, auh_heavy_freq = auh_12,
+         auh_heavy_severity = auh_13, auh_heavy_quant = auh_14) |>
+  mutate(
+    across(auh_6_1:auh_6_7,
+    ~ if_else(is.na(.x), "No", "Yes")),
+    auh_service = if_else(if_any(auh_6_1:auh_6_6, ~ . == "Yes"), "Yes", "No")
+  ) |>
+  select(-starts_with("auh_6")) |> 
+  right_join(ids, by = "subid") |>
+  relocate(subid, starts_with("demo")) |>
+  glimpse()
+  
+# ids <- screen |> 
+#   select(subid, start_date, starts_with("auh_")) |> 
+#   select(subid, start_date, "auh_3", starts_with("auh_6"), starts_with("auh_7"), 
+#          starts_with("auh_8"), "auh_10", "auh_13") |>
+#   rename(auh_onset = auh_3, auh_severity_quit = auh_10,
+#          auh_severity_heavy = auh_13) |>
+#   unite("auh_quit", auh_8_year, auh_8_month, auh_8_day, sep = "-") |>
+#   mutate(auh_quit = as.numeric(round(start_date - as_datetime(auh_quit)))) |>
+#   mutate(
+#     auh_6_7_text = case_when(
+#       auh_6_7_text == "None" ~ NA_character_,
+#       auh_6_7_text == "No resource" ~ NA_character_,
+#       auh_6_7_text == "Never used prg" ~ NA_character_,
+#       auh_6_7_text == "No services used" ~ NA_character_,
+#       auh_6_7_text == "Nothing" ~ NA_character_,
+#       auh_6_7_text == "Not Applicable" ~ NA_character_,
+#       TRUE ~ auh_6_7_text
+#     )
+#   ) |> 
+#   rename(
+#     auh_service_ltrt = auh_6_1,
+#     auh_service_strt = auh_6_2,
+#     auh_service_outpatient = auh_6_3,
+#     auh_service_indiv = auh_6_4,
+#     auh_service_group = auh_6_5,
+#     auh_service_aa = auh_6_6,
+#     auh_service_other = auh_6_7_text,
+#     auh_med = auh_7
+#   ) |> 
+#   mutate(
+#     auh_service_ltrt = if_else(is.na(auh_service_ltrt), "No", "Yes"),
+#     auh_service_strt = if_else(is.na(auh_service_strt), "No", "Yes"),
+#     auh_service_outpatient = if_else(is.na(auh_service_outpatient), "No", "Yes"),
+#     auh_service_indiv = if_else(is.na(auh_service_indiv), "No", "Yes"),
+#     auh_service_group = if_else(is.na(auh_service_group), "No", "Yes"),
+#     auh_service_aa = if_else(is.na(auh_service_aa), "No", "Yes")
+#   ) |> 
+#   select(-starts_with("auh_7"), -"auh_6_7", -start_date) |> 
+#   right_join(ids, by = "subid") |>
+#   relocate(subid, starts_with("demo")) |> 
+#   glimpse()
+```
+
+### DSM5
+
+```{r}
+ids <- screen |> 
+  select(subid, starts_with("dsm5")) |> 
+  mutate(dsm5_total = rowSums(across(starts_with("dsm5"), ~ .x == "Yes"), 
+                              na.rm = TRUE)) |> 
+  select(subid, dsm5_total) |> 
+  right_join(ids, by = "subid") |>
+  relocate(-dsm5_total) |> 
+  glimpse()
+```
+
+### YAP (Young Adult Alcohol Problems Screening Test)
+
+past year vs. lifetime
+
+chose lifetime
+
+```{r}
+screen |> 
+  select(subid, starts_with("yap")) |> 
+  mutate(
+    across(starts_with("yap"),
+           ~ if_else(.x == "No, never", "No", "Yes"))
+  ) |> 
+  skimr::skim()
+  
+ids <- screen |> 
+  select(subid, starts_with("yap")) |>
+  mutate(yap = rowSums(across(starts_with("yap"), ~ .x != "No, never"),
+                        na.rm = TRUE)) |> 
+  select(subid, yap) |> 
+  right_join(ids, by = "subid") |> 
+  relocate(-yap) |> 
+  glimpse()
+```
+
+### SCL-90
+
+SUBSCALES: somatization, obsessive-compulsive, interpersonal sensitivity, depression,
+anxiety, anger-hostility, phobic anxiety, paranoid ideation, psychoticism
+
+```{r}
+ids <- screen |> 
+  select(subid, starts_with("scl90")) |> 
+  mutate(
+    across(
+      starts_with("scl90"),
+      ~ as.numeric(factor(.x, ordered = TRUE,
+                          levels = c("Not At All", "A Little Bit", "Moderately", 
+                                     "Quite A Bit", "Extremely")))
+    ),
+    scl90 = var_score(pick(starts_with("scl90")), 
+                      forward_items = names(pick(starts_with("scl90"))))
+  ) |> 
+  select(subid, scl90) |> 
+  right_join(ids, by = "subid") |> 
+  relocate(-scl90) |> 
+  glimpse()
+```
+
+### DTS (Distress Tolerance Scale)
+
+COCO: can consider drop
+
+```{r}
+# ids <- screen |> 
+#   select(subid, starts_with("dts")) |> 
+#   mutate(
+#     across(
+#       starts_with("dts"),
+#       ~ as.numeric(factor(.x, ordered = TRUE),
+#                    levels = c("Very untrue of me", "Somewhat untrue of me",
+#                               "Neutral", "Somewhat true of me", 
+#                               "Very true of me"))
+#     ),
+#     dts = var_score(pick(starts_with("dts")),
+#                     forward_items = names(pick(starts_with("dts"), -dts_6)),
+#                     reverse_items = c("dts_6"), item_range = c(1, 5))
+#   ) |> 
+#   select(subid, dts) |> 
+#   right_join(ids, by = "subid") |> 
+#   relocate(-dts) |> 
+#   glimpse()
+```
+
+### MPS
+
+**positive emotionality**
+
+dS$MPS_PEM = round((dS$MPS_WB * 1.933) + (dS$MPS_SP * 1.669) + (dS$MPS_AC * 1.671) + (dS$MPS_SC * 1.950) + (dS$MPS_SR * 0.085) + (dS$MPS_AL * 0.292) + (dS$MPS_AG * 0.130) + (dS$MPS_CT * 0.048) + (dS$MPS_HA * 0.015) + (dS$MPS_TD * 0.070) + 13.712 )
+
+**negative emotionality**
+
+dS$MPS_NEM = round((dS$MPS_WB * 0.127) + (dS$MPS_SP * 0.150) + (dS$MPS_AC * 0.038) + (dS$MPS_SC * 0.279) + (dS$MPS_SR * 1.904) + (dS$MPS_AL * 3.061) + (dS$MPS_AG * 2.551) + (dS$MPS_CT * 0.045) + (dS$MPS_HA * 0.126) + (dS$MPS_TD * 0.147) + 6.270 )
+
+**constraint**
+
+dS$MPS_CON = round((dS$MPS_WB * -0.085) + (dS$MPS_SP * -0.052) + (dS$MPS_AC * 0.241) + (dS$MPS_SC * -0.068) + (dS$MPS_SR * 0.046) + (dS$MPS_AL * -0.302) + (dS$MPS_AG* 0.296) + (dS$MPS_CT * 2.717) + (dS$MPS_HA * 2.579) + (dS$MPS_TD * 2.199) + 20.742 )
+
+
+```{r}
+mps_wellbeing_forward <- c("mps_1", "mps_26", "mps_38", "mps_50", "mps_62",  
+                           "mps_74", "mps_85", "mps_97", "mps_109","mps_121", 
+                           "mps_133","mps_144")
+mps_wellbeing_reverse <- NULL
+
+mps_social_potency_forward <- c("mps_2", "mps_15", "mps_39", "mps_51", "mps_75",  
+                                "mps_87", "mps_110")
+mps_social_potency_reverse <- c("mps_63", "mps_98", "mps_122", "mps_134", "mps_145")
+
+mps_achievement_forward <- c("mps_3", "mps_16", "mps_27", "mps_52", "mps_76",  
+                             "mps_88", "mps_111", "mps_123","mps_135","mps_146")
+mps_achievement_reverse <- c("mps_64", "mps_99")
+
+mps_social_closeness_forward <- c("mps_5", "mps_40", "mps_77", "mps_112")
+mps_social_closeness_reverse <- c("mps_17", "mps_28", "mps_65", "mps_89", "mps_136", "mps_100",
+                          "mps_148", "mps_124")
+
+mps_stress_reaction_forward <- c("mps_6", "mps_18", "mps_29", "mps_41", "mps_53",  
+                                 "mps_78", "mps_90", "mps_101", "mps_113","mps_125", 
+                                 "mps_137","mps_149")
+mps_stress_reaction_reverse <- NULL
+
+mps_alienation_forward <- c("mps_7", "mps_19", "mps_30", "mps_42", "mps_54", 
+                            "mps_66", "mps_91", "mps_102","mps_114", "mps_126", 
+                            "mps_138","mps_150")
+mps_alienation_reverse <- NULL
+
+mps_aggression_forward <- c("mps_8", "mps_20", "mps_31", "mps_43", "mps_55",  
+                            "mps_67", "mps_103", "mps_115","mps_127","mps_139", 
+                            "mps_151")
+mps_aggression_reverse <- c("mps_79")
+
+
+mps_control_forward <- c("mps_9", "mps_44", "mps_56", "mps_68", "mps_92",  
+                         "mps_116","mps_128", "mps_140")
+mps_control_reverse <- c("mps_21", "mps_33", "mps_152", "mps_80")
+
+mps_harm_avoidance_forward <- c("mps_57", "mps_141")
+mps_harm_avoidance_reverse <- c("mps_11", "mps_22", "mps_34", "mps_46", "mps_69", 
+                                "mps_81", "mps_93", "mps_105", "mps_129",  "mps_153")
+
+mps_traditionalism_forward <- c("mps_12", "mps_23", "mps_35", "mps_58", "mps_82", 
+                                "mps_94", "mps_106","mps_142","mps_154")
+mps_traditionalism_reverse <- c("mps_47", "mps_70", "mps_118")
+
+
+mps_absorption_forward <- c("mps_13", "mps_24", "mps_36", "mps_48", "mps_59",  "mps_71", 
+                    "mps_83", "mps_95", "mps_107","mps_119",  "mps_130","mps_155")
+mps_absorption_reverse <- NULL
+
+# mps_unlikely_virtues_forward <- c("mps_25", "mps_49", "mps_72", "mps_96", "mps_120", "mps_143", "mps_147")
+# mps_unlikely_virtues_reverse <- c("mps_4", "mps_14", "mps_37", "mps_61", "mps_84",
+#                                   "mps_108", "mps_131")
+
+ids <- screen |> 
+  select(subid, starts_with("mps")) |> 
+  mutate(
+    mps_17 = if_else(mps_17 == "I tend to seek the company of a friend.", FALSE, TRUE),
+    mps_34 = if_else(mps_34 == "Having a pilot announce that the plane has engine trouble and it may be necessary to make an emergency landing.",
+                     FALSE, TRUE),
+    mps_57 = if_else(mps_57 == "Having to walk around all day on a blistered foot,",
+                     FALSE, TRUE),
+    mps_69 = if_else(mps_69 == "Being out on a sailboat during a great storm at sea,",
+                     FALSE, TRUE),
+    mps_70 = if_else(mps_70 == "Stricter observance of major religious holidays",
+                     FALSE, TRUE),
+    mps_81 = if_else(mps_81 == "Being at the circus when two lions suddenly get loose down in the ring,",
+                     FALSE, TRUE),
+    mps_93 = if_else(mps_93 == "Riding a long stretch of rapids in a canoe,",
+                     FALSE, TRUE),
+    mps_105 = if_else(mps_105 == "Being sick to my stomach for 24 hours.",
+                      TRUE, FALSE),
+    mps_129 = if_else(mps_129 == "Being in a flood", FALSE, TRUE),
+    mps_141 = if_else(mps_141 == "Being seasick every day for a week while on an ocean voyage",
+                      FALSE, TRUE),
+    across(starts_with("mps"), ~ if_else(.x == TRUE, 1, 0))
+  ) |> 
+  mutate(
+    mps_wb = var_score(pick(all_of(starts_with("mps_"))), 
+                              forward_items = mps_wellbeing_forward,
+                              reverse_items = mps_wellbeing_reverse,
+                              item_range = c(0, 1)),
+    mps_sp = var_score(pick(all_of(starts_with("mps_"))),
+                                   forward_items = mps_social_potency_forward,
+                                   reverse_items = mps_social_potency_reverse,
+                                   item_range = c(0, 1)),
+    mps_ac = var_score(pick(all_of(starts_with("mps_"))),
+                                 forward_items = mps_achievement_forward,
+                                 reverse_items = mps_achievement_reverse,
+                                 item_range = c(0, 1)),
+    mps_sc = var_score(pick(all_of(starts_with("mps_"))),
+                                      forward_items = mps_social_closeness_forward,
+                                      reverse_items = mps_social_closeness_reverse,
+                                      item_range = c(0, 1)),
+    mps_sr = var_score(pick(all_of(starts_with("mps_"))),
+                                     forward_items = mps_stress_reaction_forward,
+                                      reverse_items = mps_stress_reaction_reverse,
+                                      item_range = c(0, 1)),
+    mps_al = var_score(pick(all_of(starts_with("mps_"))),
+                               forward_items = mps_alienation_forward,
+                                      reverse_items = mps_alienation_reverse,
+                                      item_range = c(0, 1)),
+    mps_ag = var_score(pick(all_of(starts_with("mps_"))),
+                                 forward_items = mps_aggression_forward,
+                                      reverse_items = mps_aggression_reverse,
+                                      item_range = c(0, 1)),
+    mps_ct = var_score(pick(all_of(starts_with("mps_"))),
+                                 forward_items = mps_control_forward,
+                                      reverse_items = mps_control_reverse,
+                                      item_range = c(0, 1)),
+    mps_ha = var_score(pick(all_of(starts_with("mps_"))),
+                                 forward_items = mps_harm_avoidance_forward,
+                                      reverse_items = mps_harm_avoidance_reverse,
+                                      item_range = c(0, 1)),
+    mps_td = var_score(pick(all_of(starts_with("mps_"))),
+                                 forward_items = mps_traditionalism_forward,
+                                      reverse_items = mps_traditionalism_reverse,
+                                      item_range = c(0, 1)),
+    mps_ab = var_score(pick(all_of(starts_with("mps_"))),
+                                 forward_items = mps_absorption_forward,
+                                      reverse_items = mps_absorption_reverse,
+                                      item_range = c(0, 1)),
+    mps_pem = round((mps_wb * 1.933) + (mps_sp * 1.669) + (mps_ac * 1.671) + 
+                      (mps_sc * 1.950) + (mps_sr * 0.085) + (mps_al * 0.292) + 
+                      (mps_ag * 0.130) + (mps_ct * 0.048) + (mps_ha * 0.015) + 
+                      (mps_td * 0.070) + 13.712),
+    mps_nem = round((mps_wb * 0.127) + (mps_sp * 0.150) + (mps_ac * 0.038) + 
+                      (mps_sc * 0.279) + (mps_sr * 1.904) + (mps_al * 3.061) + 
+                      (mps_ag * 2.551) + (mps_ct * 0.045) + (mps_ha * 0.126) + 
+                      (mps_td * 0.147) + 6.270),
+    mps_con = round((mps_wb * -0.085) + (mps_sp * -0.052) + (mps_ac * 0.241) + 
+                      (mps_sc * -0.068) + (mps_sr * 0.046) + (mps_al * -0.302) + 
+                      (mps_ag * 0.296) + (mps_ct * 2.717) + (mps_ha * 2.579) + 
+                      (mps_td * 2.199) + 20.742)
+    
+  ) |> 
+  select(-matches("^mps_\\d+$")) |> 
+  right_join(ids, by = "subid") |> 
+  relocate(-starts_with("mps")) |> 
+  glimpse()
+```
+
+**positive emotionality**
+
+dS$MPS_PEM = round((dS$MPS_WB * 1.933) + (dS$MPS_SP * 1.669) + (dS$MPS_AC * 1.671) + (dS$MPS_SC * 1.950) + (dS$MPS_SR * 0.085) + (dS$MPS_AL * 0.292) + (dS$MPS_AG * 0.130) + (dS$MPS_CT * 0.048) + (dS$MPS_HA * 0.015) + (dS$MPS_TD * 0.070) + 13.712 )
+
+**negative emotionality**
+
+dS$MPS_NEM = round((dS$MPS_WB * 0.127) + (dS$MPS_SP * 0.150) + (dS$MPS_AC * 0.038) + (dS$MPS_SC * 0.279) + (dS$MPS_SR * 1.904) + (dS$MPS_AL * 3.061) + (dS$MPS_AG * 2.551) + (dS$MPS_CT * 0.045) + (dS$MPS_HA * 0.126) + (dS$MPS_TD * 0.147) + 6.270 )
+
+**constraint**
+
+dS$MPS_CON = round((dS$MPS_WB * -0.085) + (dS$MPS_SP * -0.052) + (dS$MPS_AC * 0.241) + (dS$MPS_SC * -0.068) + (dS$MPS_SR * 0.046) + (dS$MPS_AL * -0.302) + (dS$MPS_AG* 0.296) + (dS$MPS_CT * 2.717) + (dS$MPS_HA * 2.579) + (dS$MPS_TD * 2.199) + 20.742 )
+
+### PACS - Penn Alcohol Craving Scale
+
+```{r}
+ids <- intake |> 
+  select(subid, starts_with("pacs")) |> 
+  mutate(
+    pacs_1 = as.numeric(
+      factor(pacs_1, ordered = TRUE,
+             levels = c(
+               "Never - 0 times during this period of time",
+               "Rarely - 1 to 2 times during this period of time",
+               "Occasionally - 3 to 4 times during this period of time",
+               "Sometimes - 5 to 10 times during this period of time",
+               "Often - 11 to 20 times during this period of time",
+               "Most of the time - 20 to 40 times during this period of time",
+               "Nearly all of the time - more than 40 times or more than 6 times per day"
+               ))
+    ),
+    pacs_2 = as.numeric(
+      factor(pacs_2, ordered = TRUE,
+             levels = c(
+               "None at all",
+               "Slight, that is a very mild urge",
+               "Mild urge",
+               "Moderate urge",
+               "Strong urge, but easily controlled",
+               "Strong urge and difficult to control",
+               "Strong urge and would have drunk alcohol if it were available"
+               ))
+    ),
+    pacs_3 = as.numeric(
+      factor(pacs_3, ordered = TRUE,
+             levels = c(
+               "None at all",
+               "Less than 20 minutes",
+               "21-45 minutes",
+               "46-90 minutes",
+               "90 minutes-3 hours",
+               "Between 3 and 6 hours",
+               "More than 6 hours"
+             ))
+    ),
+    pacs_4 = as.numeric(
+      factor(pacs_4, ordered = TRUE,
+             levels = c(
+               "Not difficult at all",
+               "Very mildly difficult",
+               "Mildly difficult",
+               "Moderately difficult",
+               "Very difficult",
+               "Extremely difficult",
+               "Would not be able to resist"
+             ))
+    ),
+    pacs_5 = as.numeric(
+      factor(pacs_5, ordered = TRUE,
+             levels = c(
+               "Never thought about drinking and never had the urge to drink",
+               "Rarely thought about drinking and rarely had the urge to drink",
+               "Occasionally thought about drinking and occasionally had the urge to drink",
+               "Sometimes thought about drinking and sometimes had the urge to drink",
+               "Often thought about drinking and often had the urge to drink",
+               "Thought about drinking most of the time and had the urge to drink most of the time",
+               "Thought about drinking nearly all of the time and had the urge to drink nearly all of the time"
+             ))
+    ),
+    pacs = var_score(pick(starts_with("pacs")),
+                    forward_items = names(pick(starts_with("pacs"))))
+  ) |>
+  select(subid, pacs) |> 
+  right_join(ids, by = "subid") |> 
+  relocate(-pacs) |> 
+  glimpse()
+```
+
+### AASE - Alcohol Abstinence Self-Efficacy Scale
+
+```{r}
+ids <- intake |> 
+  select(subid, starts_with("aase")) |> 
+  mutate(
+    across(
+      starts_with("aase"),
+      ~ as.numeric(
+        factor(.x, ordered = TRUE,
+               levels = c(
+                 "Not at all", 
+                 "Not very",
+                 "Moderately",
+                 "Very",
+                 "Extremely"
+               ))
+      )
+    ),
+    aase_total = var_score(pick(starts_with("aase")),
+                           forward_items = names(pick(starts_with("aase")))),
+    aase_neg_affect = var_score(pick(starts_with("aase")), forward_items = 
+                                  c("aase_18", "aase_16", "aase_3", 
+                                    "aase_14", "aase_6")),
+    aase_social = var_score(pick(starts_with("aase")), forward_items =
+                              c("aase_15", "aase_20", "aase_4", 
+                                "aase_17", "aase_8")),
+    aase_physical = var_score(pick(starts_with("aase")), forward_items =
+                                c("aase_2", "aase_12", "aase_5", 
+                                  "aase_13", "aase_9")),
+    aase_craving = var_score(pick(starts_with("aase")), forward_items =
+                               c("aase_1", "aase_7", "aase_11", 
+                                 "aase_10", "aase_19")),
+  ) |> 
+  select(subid, "aase_total", "aase_neg_affect", "aase_social",
+         "aase_physical", "aase_craving") |> 
+  right_join(ids, by = "subid") |> 
+  relocate(-c("aase_total", "aase_neg_affect", "aase_social",
+              "aase_physical", "aase_craving")) |> 
+  glimpse()
+
+```
+
+### DASS - Depression Anxiety Stress Scale
+
+COCO: check if total score was used before
+scl90 vs. dass
+
+```{r}
+ids <- intake |> 
+  select(subid, starts_with("dass")) |> 
+  mutate(
+    across(
+      starts_with("dass21"),
+      ~ as.numeric(
+        factor(.x, ordered = TRUE,
+               levels = c("Never", "Sometimes", "Often", "Almost Always"))
+      )
+    ),
+    dass_total = var_score(pick(starts_with("dass21")),
+                           forward_items = names(pick(starts_with("dass21")))),
+    dass_anx = var_score(pick(starts_with("dass21")),
+                         forward_items = c("dass21_2", "dass21_4", "dass21_7",
+                                           "dass21_9", "dass21_15", "dass21_19",
+                                           "dass21_20")),
+    dass_dep = var_score(pick(starts_with("dass21")),
+                         forward_items = c("dass21_3", "dass21_5", "dass21_10",
+                                           "dass21_13", "dass21_16", "dass21_17",
+                                           "dass21_21")),
+    dass_stress = var_score(pick(starts_with("dass21")),
+                            forward_items = c("dass21_1", "dass21_6", "dass21_8",
+                                              "dass21_11", "dass21_12", "dass21_14",
+                                              "dass21_18"))
+  ) |> 
+  select(subid, dass_total, dass_anx, dass_dep, dass_stress) |> 
+  right_join(ids, by = "subid") |> 
+  relocate(-c("dass_total", "dass_anx", "dass_dep", "dass_stress")) |> 
+  glimpse()
+```
+
+### PSS - Perceived Stress Scale
+
+COCO: think about overlapping with dass
+
+```{r}
+# ids <- intake |> 
+#   select(subid, starts_with("pss")) |> 
+#   mutate(
+#     across(
+#       starts_with("pss"),
+#       ~ as.numeric(
+#         factor(.x, ordered = TRUE,
+#                levels = c("Never", "Almost Never", "Sometimes", "Fairly Often",
+#                           "Very Often"))
+#       )
+#     ),
+#     pss = var_score(pick(starts_with("pss")),
+#                     forward_items = c("pss_1", "pss_2", "pss_3", "pss_6",
+#                                       "pss_9", "pss_10"),
+#                     reverse_items = c("pss_4", "pss_5", "pss_7", "pss_8"),
+#                     item_range = c(1, 5))
+#   ) |> 
+#   select(subid, pss) |> 
+#   right_join(ids, by = "subid") |> 
+#   relocate(-pss) |> 
+#   glimpse()
+```
+
+### MSPSS - Multidimensional Scale of Perceived Social Support
+
+```{r}
+ids <- intake |> 
+  select(subid, starts_with("mspss")) |> 
+  mutate(
+    across(
+      starts_with("mspss"),
+      ~ as.numeric(
+        factor(.x, ordered = TRUE,
+               levels = c("Very Strongly Disagree", "Strongly Disagree",
+                          "Mildly Disagree", "Neutral", "Mildly Agree",
+                          "Strongly Agree", "Very Strongly Agree"))
+      )
+    ),
+    mspss = var_score(pick(starts_with("mspss")),
+                      forward_items = names(pick(starts_with("mspss"))))
+  ) |> 
+  select(subid, mspss) |> 
+  right_join(ids, by = "subid") |> 
+  relocate(-mspss) |> 
+  glimpse()
+```
+
+## EDA
+
+### Demographics
+
+```{r}
+ids |> 
+  select(starts_with("demo")) |>
+  select(where(is.numeric)) |> 
+  names() |> 
+  map(\(name) plot_box_violin(df = ids, x = name)) |> 
+  cowplot::plot_grid(plotlist = _, ncol = 2)
+
+ids |> 
+  select(starts_with("demo")) |> 
+  select(where(is.character)) |> 
+  names() |> 
+  map(\(name) plot_bar(df = ids, x = name)) |> 
+  cowplot::plot_grid(plotlist = _)
+```
+
+### Other
+
+   
+```{r}
+ids |> 
+  select(-starts_with("demo"), -subid) |> 
+  select(where(is.numeric)) |> 
+  names() |> 
+  map(\(name) plot_box_violin(df = ids, x = name)) |> 
+  cowplot::plot_grid(plotlist = _)
+
+# auh_quit
+max(ids$auh_quit)
+
+# auh_onset check
+sum(ids$demo_age >= ids$auh_onset_drink)
+sum(ids$demo_age >= ids$auh_onset_heavy)
+sum(ids$demo_age >= ids$auh_onset_prob)
+
+```
+
+```{r}
+ids |> 
+  select(-starts_with("demo"), -subid, -where(is.numeric)) |> 
+  names() |> 
+  map(\(name) plot_bar(df = ids, x = name)) |> 
+  cowplot::plot_grid(plotlist = _)
+
+
+```
+
+## Write Out File
+
+```{r}
+ids |> 
+  write_csv(here::here(path_multilevel, "features_ids.csv"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

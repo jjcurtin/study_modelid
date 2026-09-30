@@ -1,0 +1,28 @@
+---
+title: 
+author:
+  - name: 
+    orcid: 
+    corresponding: 
+    roles: []
+    affiliations:
+      - Department of Psychology, University of Wisconsin-Madison
+  - name: 
+    orcid: 
+    corresponding: 
+    email: 
+    roles:
+    affiliations:
+keywords:
+  - Substance use disorders
+abstract: 
+plain-language-summary: 
+key-points:
+date: last-modified
+bibliography: references.bib
+citation:
+  container-title: 
+number-sections: false 
+editor_options: 
+  chunk_output_type: console
+---

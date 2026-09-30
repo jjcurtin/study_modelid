@@ -1,0 +1,491 @@
+---
+title: "Retrain features for GLMNet model in `r params$version`"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+params:
+  version: "v32"
+  algorithm: "glmnet"
+  feature_set: "raw"
+
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+- v1: with cut_auroc at 0.86 (and sorted on hp1, hp2)
+
+  - 42 features retained
+
+- v2: without cut_auroc
+
+  - best model is lasso, 13 features retained
+
+## Set Up
+
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+library(brms, exclude = c("populate", "mixture", "ar"))
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+path_input <- format_path("optimize/modeling/chtc")
+path_models <- format_path("optimize/modeling/models")
+path_features <-  format_path("optimize/modeling/features")
+path_shared <- format_path("risk/data_processed/shared")
+path_multilevel <- format_path("risk/data_processed/multilevel")
+
+# set ggplot theme to minimal
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+ids <- read_csv(here::here(path_multilevel, "features_ids.csv")) |> glimpse()
+# demographics <- read_csv(here::here(path_shared,
+#                                     "features_demographics.csv"))
+
+
+model <- read_rds(here::here(path_models,
+                                 str_c("model_best_",
+                                       params$version, ".rds")))
+
+coeffs_optimize <- read_csv(here::here(path_models,
+                        str_c("coeffs_best_", 
+                              params$version, ".csv")),
+                       show_col_types = FALSE)
+
+configs_all <-
+  read_csv(here::here(path_models,
+                      str_c("auroc_", params$version, ".csv")),
+           show_col_types = FALSE) |>
+  mutate(algorithm = params$algorithm)
+
+d <- read_csv(here::here(path_input,
+                         str_c("train_", params$version, "/input/data_trn.csv"))) |> 
+  mutate(lapse = factor(lapse, levels = c("no lapse", "lapse")))
+```
+
+
+## Modeling
+
+### Population Model
+
+```{r}
+config <- configs_all |>
+  arrange(desc(auroc)) |>
+  slice(1) |>
+  mutate(algorithm = params$algorithm)
+
+algorithm <- config$algorithm
+feature_set <- config$feature_set
+
+if (config$resample == "none") {
+  resample <- config$resample
+} else {
+  resample <- str_split(config$resample, "_")[[1]][1]
+  ratio <- as.numeric(str_split(config$resample, "_")[[1]][2])
+}
+
+
+rec <- recipe(lapse ~ ., data = d) |>
+  step_select(-dttm_label, -strat, -subid) |>
+  # step_rm(ema_1.maxraw.p24) |> 
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  themis::step_downsample(lapse, under_ratio = ratio, seed = 10) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors()) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+  step_rm(where(~ any(is.na(.)))) |> 
+  step_nzv(all_predictors())
+
+rec_prep <- prep(rec, training = d, retain = TRUE)
+
+feat <- bake(rec_prep, new_data = NULL)
+feat_out <- bake(rec_prep, new_data = d)
+  
+model_glmnet <- logistic_reg(
+  penalty = config$hp2,
+  mixture = config$hp1
+) |> 
+  set_engine("glmnet") |> 
+    set_mode("classification") |> 
+  fit(lapse ~ ., data = feat)
+  
+pred_prob_population <- predict(model_glmnet, feat_out, type = "prob")$`.pred_no lapse`
+  
+coeffs_population <- model_glmnet |> tidy() |> as_tibble() |> 
+  mutate(term = if_else(term == "(Intercept)", "Intercept", term)) |> 
+  select(-penalty) |> 
+  filter(estimate != 0)
+
+
+rm(rec, rec_prep, feat)
+```
+
+```{r}
+model_glmnet |> write_rds(here::here(format_path("risk/models/multilevel"),
+                              "model_glmnet_v2.rds"))
+```
+
+
+### Multilevel Model
+
+```{r}
+coeffs_lst <- coeffs_population |> 
+  filter(term != "Intercept") |> 
+  pull(term)
+
+rec <- recipe(lapse ~ ., data = d) |>
+  step_select(-dttm_label, -strat) |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_impute_mode(all_nominal_predictors()) |>
+  step_zv(all_predictors()) |>
+  step_normalize(all_numeric_predictors(), -subid) |>
+  step_dummy(all_nominal_predictors(), one_hot = TRUE)
+
+rec_prep <- prep(rec, training = d, retain = TRUE)
+
+feat <- bake(rec_prep, new_data = NULL) |> 
+  select(all_of(coeffs_lst), subid, lapse)
+feat_out <- bake(rec_prep, new_data = d) |> 
+  select(all_of(coeffs_lst), subid, lapse)
+
+effects <- feat |>
+  select(-subid, -lapse) |>
+  names() |>
+  paste(collapse = " + ")
+
+brms_formula <- str_c("lapse ~ ", effects, " + (1 + ", effects, " | subid)")
+
+model_glmer <- lme4::glmer(
+  formula = as.formula(brms_formula),
+  data = feat,
+  family = binomial(link = "logit"),
+  control = lme4::glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 2e5)
+  )
+)
+
+# if (file.exists(here::here(format_path("risk/models/multilevel"),
+#                        "model_multilevel_v2.rds"))) {
+#   model_bayes <- read_rds(here::here(format_path("risk/models/multilevel"),
+#                                      "model_multilevel_v2.rds"))
+# } else {
+#   model_bayes <- brm(
+#     formula = as.formula(brms_formula),
+#     data = feat,
+#     family = bernoulli(link = "logit"),
+#     prior = c(
+#       set_prior("normal(0, 1)", class = "b"),
+#       set_prior("normal(-2.5, 1)", class = "Intercept"),
+#       set_prior("exponential(1)", class = "sd")
+#     ),
+#     init = 0,
+#     chains = 4,
+#     iter = 5000,
+#     warmup = 2000,
+#     cores = 4,
+#     seed = 123,
+#     control = list(adapt_delta = 0.95),
+#     save_pars = save_pars(all = TRUE)
+#     )
+# }
+
+
+```
+
+```{r}
+# pred_prob_multilevel <- fitted(model_bayes, newdata = feat_out)[, "Estimate"]
+# pred_prob_multilevel_fixed <- fitted(model_bayes, newdata = feat_out, re_formula = NA)[, "Estimate"]
+#   
+# coeffs_multilevel <- fixef(model_bayes) |> 
+#   as_tibble(rownames = "term")
+# random_effs_multilevel <- ranef(model_bayes)$subid[, "Estimate", ] |> 
+#   as_tibble(rownames = "subid")
+```
+
+```{r}
+# model_bayes |> write_rds(here::here(format_path("risk/models/multilevel"),
+#                               "model_multilevel_v2.rds"))
+```
+
+```{r}
+coeffs_multilevel <- fixef(model_glmer) |> 
+  as_tibble(rownames = "term") |> 
+  mutate(term = if_else(term == "(Intercept)", "Intercept", term))
+random_effs_multilevel <- ranef(model_glmer)$subid |> 
+  as_tibble(rownames = "subid") |> 
+  rename(Intercept = `(Intercept)`)
+
+coeffs <- coeffs_population |> 
+  rename(population = estimate) |> 
+  right_join(coeffs_multilevel |> rename(multilevel = value),
+             by = "term") |> 
+  select(term, population, multilevel)
+
+coeffs |> write_csv(here::here(format_path("risk/data_processed/multilevel"),
+                       "coeffs_glmer_v2.csv"))
+random_effs_multilevel |>
+  write_csv(here::here(format_path("risk/data_processed/multilevel"),
+                       "random_effects_glmer_v2.csv"))
+```
+
+## Train compact models
+
+
+```{r}
+walk(
+  names(feat |> select(-subid, -lapse)),
+  \(feat_excl) {
+    
+    feat_name <- str_replace_all(feat_excl, stringr::fixed("."), "_")
+    
+    file_path <- str_c(
+      "~/Desktop/model_save/glmer/",
+      feat_name,
+      ".rds"
+    )
+    
+    if (file.exists(file_path)) {
+      message("Existing model found: ", feat_excl)
+      
+    } else {
+      
+      message("Fitting model: ", feat_excl)
+      
+      fixed_effects <- feat |>
+        select(-c("subid", "lapse")) |>
+        names() |> 
+        paste(collapse = " + ")
+      
+      random_effects <- feat |> 
+        select(-c("subid", "lapse", feat_excl)) |>
+        names() |> 
+        paste(collapse = " + ")
+      
+      brms_formula <- str_c(
+        "lapse ~ ", fixed_effects,
+        " + (1 + ", random_effects, " | subid)"
+      )
+      
+      model_compact <- lme4::glmer(
+        formula = as.formula(brms_formula),
+        data = feat,
+        family = binomial(link = "logit"),
+        control = lme4::glmerControl(
+          optimizer = "bobyqa",
+          optCtrl = list(maxfun = 2e5)
+        )
+      )
+      
+      write_rds(
+        model_compact,
+        file_path
+      )
+      
+      rm(model_compact)
+      gc()
+    }
+  }
+)
+```
+
+```{r}
+walk(
+  names(feat |> select(-subid, -lapse)),
+  \(feat_excl) {
+    
+    feat_name <- str_replace_all(feat_excl, stringr::fixed("."), "_")
+    
+    file_path <- str_c(
+      "~/Desktop/model_save/",
+      feat_name,
+      ".rds"
+    )
+    
+    if (file.exists(file_path)) {
+      message("Existing model found: ", feat_excl)
+      
+    } else {
+      
+      message("Fitting model: ", feat_excl)
+      
+      fixed_effects <- feat |>
+        select(-c("subid", "lapse")) |>
+        names() |> 
+        paste(collapse = " + ")
+      
+      random_effects <- feat |> 
+        select(-c("subid", "lapse", feat_excl)) |>
+        names() |> 
+        paste(collapse = " + ")
+      
+      brms_formula <- str_c(
+        "lapse ~ ", fixed_effects,
+        " + (1 + ", random_effects, " | subid)"
+      )
+      
+      model_compact <- brm(
+        formula = as.formula(brms_formula),
+        data = feat,
+        family = bernoulli(link = "logit"),
+        prior = c(
+          set_prior("normal(0, 1)", class = "b"),
+          set_prior("normal(-2.5, 1)", class = "Intercept"),
+          set_prior("exponential(1)", class = "sd")
+        ),
+        init = 0,
+        chains = 4,
+        iter = 5000,
+        warmup = 2000,
+        cores = 4,
+        seed = 123,
+        control = list(adapt_delta = 0.95),
+        save_pars = save_pars(all = TRUE)
+      )
+      
+      write_rds(
+        model_compact,
+        file_path
+      )
+      
+      rm(model_compact)
+      gc()
+    }
+  }
+)
+```
+
+
+## Sanity check
+
+### Probabilities
+
+**Compare population level model to multilevel model**
+
+Quick compare of predicted probabilities
+```{r}
+probs <- tibble(
+  multilevel = 1 - pred_prob_multilevel,
+  multilevel_fixed = 1 - pred_prob_multilevel_fixed,
+  population = 1 - pred_prob_population
+)
+
+cor(probs$multilevel, probs$population)
+cor(probs$multilevel_fixed, probs$population)
+
+ggplot() +
+    geom_point(data = probs, aes(x = population, y = multilevel)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red",
+                linewidth = 1) +
+    labs(x = "Population-Level Model Predicted Probability",
+         y = "Multilevel Model Predicted Probability")
+
+ggplot() +
+    geom_point(data = probs, aes(x = population, y = multilevel_fixed)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red",
+                linewidth = 1) +
+    labs(x = "Population-Level Model Predicted Probability",
+         y = "Multilevel Model Predicted Probability")
+```
+
+### Parameters
+
+
+```{r}
+coeffs <- coeffs_population |> 
+  rename(population = estimate) |> 
+  right_join(coeffs_multilevel |> rename(multilevel = Estimate),
+             by = "term") |> 
+  select(term, population, multilevel)
+
+coeffs
+
+# cor(coeffs$multilevel, coeffs$population)
+
+mean(coeffs$multilevel - coeffs$population)
+```
+
+optimize vs. retained features
+```{r}
+coeffs_optimize$term
+coeffs$term
+```
+
+higher variance in parameter estimates for multilevel vs. population
+
+```{r}
+coeffs |> 
+  group_by(term) |> 
+  summarize(
+    multilevel_mean = mean(multilevel),
+    multilevel_sd = sd(multilevel),
+    population_mean = mean(population),
+    population_sd = sd(population)
+  ) |> 
+  print_kbl()
+```
+
+```{r}
+coeffs |> 
+  arrange(term) |> 
+  print_kbl()
+
+coeffs |> 
+  mutate(diff = multilevel - population) |> 
+  arrange(desc(abs(diff))) |> 
+  print_kbl()
+
+coeffs |> 
+  mutate(diff = multilevel - population) |> 
+  group_by(term) |> 
+  summarize(
+    diff_mean = mean(diff),
+    diff_sd = sd(diff)
+  ) |> 
+  arrange(desc(abs(diff_mean))) |> 
+  print_kbl()
+```
+
+
+```{r}
+coeffs |> write_csv(here::here(format_path("risk/data_processed/multilevel"),
+                       "coeffs_v2.csv"))
+random_effs_multilevel |> write_csv(here::here(format_path("risk/data_processed/multilevel"),
+                       "random_effects_v2.csv"))
+```
+
+
+### bayesian posteriors
+
+```{r}
+random_effect_draws <- model_bayes |>
+  tidybayes::spread_draws(r_subid[subid, term])
+```
+
