@@ -17,7 +17,9 @@ editor_options:
 
 ## Notes
 
+- v4 & v5 in archive: old model with cut_auroc (v4 for population and v5 for multilevel)
 
+- v2 for glmer only (never did 5-fold cv for bayesian models)
 
 ## Set Up
 
@@ -201,14 +203,14 @@ for (i in 1:length(splits_kfold$splits)){
 ```
 
 ```{r}
-# results_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
-#                                 "cv_results_v4.csv"))
-# pred_prob_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
-#                                 "prob_out_v4.csv"))
-# model_lst_population |> write_rds(here::here(format_path("risk/models/multilevel"),
-#                                              "model_v4.rds"))
-# reg_coeff_population |> write_csv(here::here(format_path("risk/models/multilevel"),
-#                                 "reg_coeff_v4.csv"))
+results_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+                                "cv_results_population_v2.csv"))
+pred_prob_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+                                "prob_out_population_v2.csv"))
+model_lst_population |> write_rds(here::here(format_path("risk/models/multilevel"),
+                                             "model_population_v2.rds"))
+reg_coeff_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+                                "reg_coeff_population_v2.csv"))
 ```
 
 ### Multilevel Model
@@ -256,23 +258,23 @@ for (i in 1:length(splits_kfold$splits)){
     family = binomial(link = "logit"),
     control = lme4::glmerControl(
       optimizer = "bobyqa",
-      optCtrl = list(maxfun = 1e6)
+      optCtrl = list(maxfun = 1e7)
     )
   )
 
-  preds <- predict(
-    model_glmer,
-    newdata = feat_tst,
-    type = "response",
-    re.form = NULL
-  )
-  
-  preds_fixed <- predict(
-    model_glmer,
-    newdata = feat_tst,
-    type = "response",
-    re.form = NA
-  )
+  # preds <- predict(
+  #   model_glmer,
+  #   newdata = feat_tst,
+  #   type = "response",
+  #   re.form = NULL
+  # )
+  # 
+  # preds_fixed <- predict(
+  #   model_glmer,
+  #   newdata = feat_tst,
+  #   type = "response",
+  #   re.form = NA
+  # )
   
   preds <- predict(
     model_glmer,
@@ -334,9 +336,9 @@ for (i in 1:length(splits_kfold$splits)){
     )
   
   pred_prob_tbl_multilevel <- pred_prob_tbl_multilevel |> 
-    rbind(preds)
+    rbind(tibble(prob = preds))
   pred_prob_tbl_multilevel_fixed <- pred_prob_tbl_multilevel_fixed |> 
-    rbind(preds_fixed)
+    rbind(tibble(prob = preds_fixed))
   
   fix_effs_multilevel <- fixef(model_glmer) |>
     as_tibble(rownames = "term") |>
@@ -358,18 +360,20 @@ for (i in 1:length(splits_kfold$splits)){
 }
 ```
 
-
 ```{r}
-# results_tbl_multilevel |> write_csv(here::here(format_path("risk/models/multilevel"),
-#                                 "cv_results_v5.csv"))
-# pred_prob_tbl_multilevel |> write_csv(here::here(format_path("risk/models/multilevel"),
-#                                       "prob_out_v5.csv"))
-# pred_prob_tbl_multilevel_fixed |> write_csv(here::here(format_path("risk/models/multilevel"),
-#                                       "prob_out_fixed_v5.csv"))
-# fix_eff_tbl_multilevel |> write_csv(here::here(format_path("risk/models/multilevel"),
-#                                       "fix_eff_v5.csv"))
-# rand_eff_tbl_multilevel |> write_rds(here::here(format_path("risk/models/multilevel"),
-#                                       "rand_eff_v5.rds"))
+results_tbl_multilevel |> write_csv(here::here(format_path("risk/models/multilevel"),
+                                "cv_results_multilevel_v2.csv"))
+pred_prob_tbl_multilevel |> write_csv(here::here(format_path("risk/models/multilevel"),
+                                      "prob_out_multilevel_v2.csv"))
+pred_prob_tbl_multilevel_fixed |> 
+  write_csv(here::here(format_path("risk/models/multilevel"),
+                       "prob_out_fixed_multilevel_v2.csv"))
+fix_eff_tbl_multilevel |> write_csv(here::here(format_path("risk/models/multilevel"),
+                                      "fix_eff_multilevel_v2.csv"))
+rand_eff_tbl_multilevel |> write_rds(here::here(format_path("risk/models/multilevel"),
+                                      "rand_eff_multilevel_v2.rds"))
+model_lst_multilevel |> write_rds(here::here(format_path("risk/models/multilevel"),
+                                             "model_multilevel_v2.rds"))
 ```
 
 ## Sanity check

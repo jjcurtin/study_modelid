@@ -1,0 +1,580 @@
+---
+title: "Interaction Terms"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+params:
+  version: "v32"
+  algorithm: "glmnet"
+  feature_set: "raw"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+- v4 & v5 in archive: old model with cut_auroc (v4 for population and v5 for multilevel)
+
+- v2 for glmer only (never did 5-fold cv for bayesian models)
+
+## Set Up
+
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+library(brms, exclude = c("populate", "mixture", "ar"))
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+path_input <- format_path("optimize/modeling/chtc")
+path_models <- format_path("optimize/modeling/models")
+path_features <-  format_path("optimize/data_processed/features")
+path_shared <- format_path("risk/data_processed/shared")
+path_multilevel <- format_path("risk/data_processed/multilevel")
+
+# set ggplot theme to minimal
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+# model <- read_rds(here::here(path_models,
+#                                  str_c("model_best_",
+#                                        params$version, ".rds")))
+
+# coeffs <- read_csv(here::here(path_models,
+#                         str_c("coeffs_best_", 
+#                               params$version, ".csv")),
+#                        show_col_types = FALSE)
+
+configs_all <-
+  read_csv(here::here(path_models,
+                      str_c("auroc_", params$version, ".csv")),
+           show_col_types = FALSE) |>
+  mutate(algorithm = params$algorithm)
+
+ids <- read_csv(here::here(path_multilevel, "features_ids.csv")) |> 
+  glimpse()
+
+d <- read_csv(here::here(path_input,
+                         str_c("train_", params$version, "/input/data_trn.csv")))
+
+```
+
+```{r}
+ids <- ids |> 
+  filter(subid %in% d$subid) |> 
+  glimpse()
+
+ids <- ids |> 
+  mutate(
+    demo_sex = if_else(demo_sex == "Male", 1, 0),
+    demo_race = if_else(demo_race == "White/Caucasian", 1, 0),
+    auh_service = if_else(auh_service == "Yes", 1, 0),
+    auh_ndrinks_week = auh_heavy_quant * auh_heavy_freq
+  )
+
+ids <- ids |>
+  mutate(
+    across(
+      -c(subid, demo_sex, demo_race, auh_service),
+      ~ as.numeric(scale(.x))
+    )
+  ) |> 
+  glimpse()
+
+id_characetrics <- c("demo_age", "demo_sex", "demo_race", "demo_income", 
+         "mps_pem", "mps_nem", "mps_con",
+         "scl90", "dass_anx", "dass_dep", "dass_stress", "mspss",
+         "auh_service", "auh_onset_heavy", "auh_quit_attempts", 
+         "auh_ndrinks_week", "dsm5_total", "pacs", "yap", "aase_total")
+
+ids <- ids |>
+  select(subid, all_of(id_characetrics))
+
+names(ids)[names(ids) != "subid"] <- paste0("id_", names(ids)[names(ids) != "subid"])
+```
+
+## Modeling
+
+```{r}
+set.seed(03050321)
+splits_kfold <- d |>
+  vfold_cv(v = 5, repeats = 1, strata = "lapse")
+
+# check participant distribution
+map_dfr(splits_kfold$splits, \(s) {
+  assessment(s) |>
+    summarize(n_subid_trn = n_distinct(subid)) |> 
+    cbind(
+      analysis(s) |> 
+        summarize(n_subid_test = n_distinct(subid))
+    )
+})
+
+splits_variance <- map2(
+  splits_kfold$splits,
+  seq_along(splits_kfold$splits),
+  \(s, i) {
+    assessment(s) |> 
+      tabyl(subid) |> 
+      select(subid, n) |> 
+      rename(!!paste0("split_", i) := n)
+  }
+) |> 
+  reduce(full_join, by = "subid")
+
+splits_variance |> 
+  rowwise() |>
+    mutate(
+      n_sd  = sd(c_across(starts_with("split_")))
+    ) |>
+  ungroup() |> 
+  arrange(desc(n_sd))
+```
+
+
+### Population Model
+
+```{r}
+results_tbl_population <- tibble()
+pred_prob_tbl_population <- tibble()
+model_lst_population <- list()
+reg_coeff_population <- tibble()
+
+config <- configs_all |>
+  arrange(desc(auroc)) |>
+  slice(1) |>
+  mutate(algorithm = params$algorithm)
+
+algorithm <- config$algorithm
+feature_set <- config$feature_set
+
+if (config$resample == "none") {
+  resample <- config$resample
+} else {
+  resample <- str_split(config$resample, "_")[[1]][1]
+  ratio <- as.numeric(str_split(config$resample, "_")[[1]][2])
+}
+
+
+for (i in 1:length(splits_kfold$splits)){
+  
+  split <- splits_kfold$splits[[i]]
+
+  rec <- recipe(lapse ~ ., data = analysis(split)) |>
+    step_select(-dttm_label, -strat, -subid) |>
+    # step_rm(ema_1.maxraw.p24) |> 
+    step_impute_median(all_numeric_predictors()) |>
+    step_impute_mode(all_nominal_predictors()) |>
+    themis::step_downsample(lapse, under_ratio = ratio, seed = 10) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+    step_rm(where(~ any(is.na(.)))) |> 
+    step_nzv(all_predictors())
+
+  rec_prep <- prep(rec, training = analysis(split), retain = TRUE)
+
+  feat_trn <- bake(rec_prep, new_data = NULL)
+  feat_tst <- bake(rec_prep, new_data = assessment(split))
+  
+  model_glmnet <- logistic_reg(
+    penalty = config$hp2,
+    mixture = config$hp1
+  ) |> 
+    set_engine("glmnet") |> 
+      set_mode("classification") |> 
+    fit(lapse ~ ., data = feat_trn)
+  
+  model_lst_population[[i]] <- model_glmnet
+  
+  auroc_trn <- tibble(
+    truth = factor(as.numeric(feat_trn$lapse)),
+    .pred_1 = predict(model_glmnet, feat_trn, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  auroc_tst <- tibble(
+    truth = factor(as.numeric(feat_tst$lapse)),
+    .pred_1 = predict(model_glmnet, feat_tst, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  results_tbl_population <- results_tbl_population |> 
+    rbind(tibble(
+      id = i,
+      auroc_trn = auroc_trn$.estimate,
+      auroc_tst = auroc_tst$.estimate
+    ))
+  
+  pred_prob_tbl_population <- pred_prob_tbl_population |> 
+    rbind(tibble(prob = 
+                   predict(model_glmnet, feat_tst, type = "prob")$`.pred_no lapse`))
+  
+  reg_coeff_population <- reg_coeff_population |> 
+    rbind(model_glmnet |> tidy() |> mutate(fold = i) |> relocate(fold))
+  
+}
+
+```
+
+```{r}
+results_tbl <- tibble()
+pred_prob_tbl <- tibble()
+model_lst <- list()
+reg_coeff <- tibble()
+
+config <- configs_all |>
+  arrange(desc(auroc)) |>
+  slice(1) |>
+  mutate(algorithm = params$algorithm)
+
+algorithm <- config$algorithm
+feature_set <- config$feature_set
+
+if (config$resample == "none") {
+  resample <- config$resample
+} else {
+  resample <- str_split(config$resample, "_")[[1]][1]
+  ratio <- as.numeric(str_split(config$resample, "_")[[1]][2])
+}
+
+
+for (i in 1:length(splits_kfold$splits)){
+  
+  split <- splits_kfold$splits[[i]]
+  
+  feat <- analysis(split) |> 
+    left_join(ids, by = "subid")
+
+  rec <- recipe(lapse ~ ., data = feat) |>
+    step_select(-dttm_label, -strat, -subid) |>
+    # step_rm(ema_1.maxraw.p24) |> 
+    step_impute_median(all_numeric_predictors()) |>
+    step_impute_mode(all_nominal_predictors()) |>
+    themis::step_downsample(lapse, under_ratio = ratio, seed = 10) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors(),
+                   -starts_with("id")) |>
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+    step_rm(where(~ any(is.na(.)))) |> 
+    step_nzv(all_predictors()) |> 
+    step_interact(terms = ~ ema_1_5.recentraw.p0:id_auh_ndrinks_week) |> 
+    step_interact(terms = ~ ema_1_5.recentraw.p0:id_dsm5_total) |> 
+    step_interact(terms = ~ ema_1_5.recentraw.p0:id_yap) |> 
+    step_interact(terms = ~ ema_2.maxraw.p168:id_auh_ndrinks_week) |> 
+    step_interact(terms = ~ ema_2.maxraw.p168:id_dsm5_total) |> 
+    step_interact(terms = ~ ema_2.maxraw.p168:id_yap) |>
+    step_interact(terms = ~ ema_4.medraw.p168:id_mspss) |> 
+    step_interact(terms = ~ ema_4.medraw.p168:id_dsm5_total) |>
+    step_interact(terms = ~ ema_4.medraw.p168:id_pacs) |> 
+    step_interact(terms = ~ ema_lapse.countraw.p168:id_dass_anx) |>
+    step_interact(terms = ~ ema_lapse.countraw.p168:id_dsm5_total) |> 
+    step_interact(terms = ~ ema_lapse.countraw.p168:id_pacs) |> 
+    step_interact(terms = ~ ema_lapse.countraw.p48:id_auh_ndrinks_week) |> 
+    step_interact(terms = ~ ema_lapse.countraw.p48:id_dsm5_total) |> 
+    step_interact(terms = ~ gps_normentropy.raw.p168:id_auh_ndrinks_week) |> 
+    step_interact(terms = ~ gps_normentropy.raw.p168:id_dsm5_total) |> 
+    step_interact(terms = ~ gps_normentropy.raw.p168:id_pacs) |> 
+    step_interact(terms = ~ gps_risk_medium.durraw.p168:id_demo_sex) |> 
+    step_interact(terms = ~ gps_type_aa.durraw.p168:id_dass_anx) |> 
+    step_interact(terms = ~ gps_type_aa.durraw.p168:id_dsm5_total) |>
+    step_interact(terms = ~ gps_type_aa.durraw.p168:id_pacs) |>
+    step_interact(terms = ~ gps_type_restaurant.durraw.p168:id_dsm5_total) |>
+    step_select(-starts_with("id_"))
+
+  rec_prep <- prep(rec, training = feat, retain = TRUE)
+
+  feat_trn <- bake(rec_prep, new_data = NULL)
+  feat_tst <- bake(rec_prep, new_data = assessment(split) |> 
+                     left_join(ids, by = "subid"))
+  
+  model_glmnet <- logistic_reg(
+    penalty = config$hp2,
+    mixture = config$hp1
+  ) |> 
+    set_engine("glmnet") |> 
+      set_mode("classification") |> 
+    fit(lapse ~ ., data = feat_trn)
+  
+  model_lst[[i]] <- model_glmnet
+  
+  auroc_trn <- tibble(
+    truth = factor(as.numeric(feat_trn$lapse)),
+    .pred_1 = predict(model_glmnet, feat_trn, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  auroc_tst <- tibble(
+    truth = factor(as.numeric(feat_tst$lapse)),
+    .pred_1 = predict(model_glmnet, feat_tst, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  results_tbl <- results_tbl |> 
+    rbind(tibble(
+      id = i,
+      auroc_trn = auroc_trn$.estimate,
+      auroc_tst = auroc_tst$.estimate
+    ))
+  
+  pred_prob_tbl <- pred_prob_tbl |> 
+    rbind(tibble(prob = 
+                   predict(model_glmnet, feat_tst, type = "prob")$`.pred_no lapse`))
+  
+  reg_coeff <- reg_coeff |> 
+    rbind(model_glmnet |> tidy() |> mutate(fold = i) |> relocate(fold))
+  
+}
+
+```
+
+```{r}
+# results_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+#                                 "cv_results_population_v2.csv"))
+# pred_prob_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+#                                 "prob_out_population_v2.csv"))
+# model_lst_population |> write_rds(here::here(format_path("risk/models/multilevel"),
+#                                              "model_population_v2.rds"))
+# reg_coeff_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+#                                 "reg_coeff_population_v2.csv"))
+```
+
+
+## Sanity check
+
+### Model Prediction
+
+```{r}
+feat_test <- map(1:5, \(i) assessment(splits_kfold$splits[[i]]) |> mutate(fold = i)) |> 
+  list_rbind()
+```
+
+
+```{r}
+results_tbl_population
+results_tbl_multilevel
+
+results_tbl_population$auroc_tst |> median()
+results_tbl_multilevel$auroc_tst |> median()
+results_tbl_multilevel$auroc_tst_fixed |> median()
+```
+
+
+### Parameters
+
+```{r}
+coeffs <- reg_coeff_population |> 
+  mutate(term = if_else(term == "(Intercept)", "Intercept", term)) |> 
+  select(fold, term, estimate) |> 
+  rename(population = estimate) |> 
+  right_join(fix_eff_tbl_multilevel |> rename(multilevel = Estimate) |> 
+               select(fold, term, multilevel),
+             by = c("fold", "term"))
+
+coeffs
+
+# cor(coeffs$multilevel, coeffs$population)
+
+mean(coeffs$multilevel - coeffs$population)
+```
+
+higher variance in parameter estimates for multilevel vs. population
+
+```{r}
+coeffs |> 
+  group_by(term) |> 
+  summarize(
+    multilevel_mean = mean(multilevel),
+    multilevel_sd = sd(multilevel),
+    population_mean = mean(population),
+    population_sd = sd(population)
+  ) |> 
+  print_kbl()
+```
+
+```{r}
+coeffs |> 
+  arrange(term) |> 
+  print_kbl()
+
+coeffs |> 
+  mutate(diff = multilevel - population) |> 
+  relocate(fold, term, diff) |> 
+  arrange(desc(abs(diff))) |> 
+  print_kbl()
+
+coeffs |> 
+  mutate(diff = multilevel - population) |> 
+  group_by(term) |> 
+  summarize(
+    diff_mean = mean(diff),
+    diff_sd = sd(diff)
+  ) |> 
+  arrange(desc(abs(diff_mean))) |> 
+  print_kbl()
+```
+
+
+**Compare population level model to multilevel model**
+
+Quick compare of predicted probabilities
+```{r}
+probs <- tibble(
+  multilevel = 1 - pred_prob_tbl_multilevel$Estimate,
+  multilevel_fixed = 1 - pred_prob_tbl_multilevel_fixed$Estimate,
+  population = 1 - pred_prob_tbl_population$prob
+)
+
+cor(probs$multilevel, probs$population)
+cor(probs$multilevel_fixed, probs$population)
+cor(probs$multilevel_fixed, probs$multilevel)
+
+ggplot() +
+    geom_point(data = probs, aes(x = population, y = multilevel)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red",
+                linewidth = 1) +
+    labs(x = "Population-Level Model Predicted Probability",
+         y = "Multilevel Model (with random effects) Predicted Probability")
+
+ggplot() +
+    geom_point(data = probs, aes(x = population, y = multilevel_fixed)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red",
+                linewidth = 1) +
+    labs(x = "Population-Level Model Predicted Probability",
+         y = "Multilevel Model (without random effects) Predicted Probability")
+
+ggplot() +
+    geom_point(data = probs, aes(x = multilevel, y = multilevel_fixed)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red",
+                linewidth = 1) +
+    labs(x = "Multilevel Model (with random effects) Predicted Probability",
+         y = "Multilevel Model (without random effects) Predicted Probability")
+```
+
+
+
+## Fairness Analysis
+
+
+```{r}
+d_fairness <- feat_test |> 
+  select(fold, subid, dttm_label, lapse) |> 
+  cbind(probs) |> 
+  left_join(ids |> select(subid, starts_with("demo")), by = "subid") |> 
+  glimpse()
+```
+
+**Sex**
+
+```{r}
+d_fairness_male <- d_fairness |> 
+  filter(demo_sex == "Male") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+d_fairness_female <- d_fairness |> 
+  filter(demo_sex == "Female") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+# check if all folds have lapses
+d_fairness_male |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+d_fairness_female |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+
+# Comparison
+fairness_sex <- full_join(
+  d_fairness_male |> 
+    group_by(fold) |> 
+    summarize(
+      male_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      male_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      male_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    ),
+  d_fairness_female |> 
+    group_by(fold) |> 
+    summarize(
+      female_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      female_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      female_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    )
+) |> 
+  mutate(diff_multilevel = male_multilevel - female_multilevel,
+         diff_multilevel_fixed = male_multilevel_fixed - female_multilevel_fixed,
+         diff_population = male_population - female_population) |> 
+  relocate(fold, diff_multilevel, diff_multilevel_fixed, diff_population) 
+
+fairness_sex
+
+fairness_sex |> skimr::skim_without_charts()
+```
+
+**Race**
+
+```{r}
+d_fairness_white <- d_fairness |> 
+  filter(demo_race == "White/Caucasian") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+d_fairness_nonwhite <- d_fairness |> 
+  filter(demo_race != "White/Caucasian") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+# check if all folds have lapses
+d_fairness_white |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+d_fairness_nonwhite |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+
+# Comparison
+fairness_race <- full_join(
+  d_fairness_white |> 
+    group_by(fold) |> 
+    summarize(
+      white_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      white_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      white_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    ),
+  d_fairness_nonwhite |> 
+    group_by(fold) |> 
+    summarize(
+      nonwhite_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      nonwhite_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      nonwhite_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    )
+) |> 
+  mutate(diff_multilevel = white_multilevel - nonwhite_multilevel,
+         diff_multilevel_fixed = white_multilevel_fixed - nonwhite_multilevel_fixed,
+         diff_population = white_population - nonwhite_population) |> 
+  relocate(fold, diff_multilevel, diff_multilevel_fixed, diff_population)
+
+fairness_race
+
+fairness_race |> skimr::skim()
+```

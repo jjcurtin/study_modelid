@@ -1,0 +1,197 @@
+---
+title: "Model Comparison With and Without Random Effects"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+params:
+  version: "v32"
+  algorithm: "glmnet"
+  feature_set: "raw"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+## Setup
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+library(brms, exclude = c("populate", "mixture", "ar"))
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/var_score.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+# source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+
+path_shared <- format_path("risk/data_processed/shared")
+path_multilevel <- format_path("risk/data_processed/multilevel")
+path_input <- format_path("optimize/modeling/chtc")
+
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+feat <- read_csv(here::here(path_multilevel, "feat_model.csv")) |> 
+  mutate(lapse = factor(lapse))
+
+full_model <- read_rds(
+  here::here(
+    format_path("risk/models/multilevel"),
+    "model_multilevel_glmer_v2.rds"
+  )
+)
+compact_model_glmer_files <- list.files(
+  path = "~/Desktop/model_save/glmer",
+  pattern = "\\.rds$",
+  full.names = TRUE
+)
+
+compact_model_glm <- read_rds(
+  here::here(
+    format_path("risk/models/multilevel"),
+    "model_multilevel_glm_v2.rds"
+  )
+)
+
+aug_model_glmer_files <- list.files(
+  path = "~/Desktop/model_save/glm",
+  pattern = "\\.rds$",
+  full.names = TRUE
+)
+```
+
+## Analysis
+
+### Full Model vs. Removal of Each Random Effect
+
+```{r}
+results <- map(
+  compact_model_glmer_files,
+  \(file) {
+    
+    message("Processing: ", basename(file))
+    
+    compact_model <- read_rds(file)
+
+    anova(full_model, compact_model, test = "LRT") |> 
+      as_tibble() |> 
+      mutate(
+        rand_effect = str_remove(basename(file), ".rds")
+      )
+    
+  }
+) |> 
+  list_rbind()
+```
+
+### Compact Model (glm) vs. Each Random Effect Added
+
+```{r}
+results2 <- map(
+  aug_model_glmer_files,
+  \(file) {
+    
+    message("Processing: ", basename(file))
+    
+    aug_model <- read_rds(file)
+
+    anova(aug_model, compact_model_glm, test = "LRT") |> 
+      as_tibble() |> 
+      mutate(
+        rand_effect = str_remove(basename(file), ".rds")
+      )
+    
+  }
+) |> 
+  list_rbind()
+```
+
+```{r}
+set.seed(1221)
+
+B <- 1000
+
+bootstrap_results <- map(
+  aug_model_glmer_files,
+  \(file) {
+    
+    message("Processing: ", basename(file))
+    
+    aug_model <- read_rds(file)
+    
+    lrt_boot <- replicate(B, {
+      
+      # simulate outcome under H0
+      y_sim <- simulate(compact_model_glm, nsim = 1)[[1]]
+      
+      # refit GLM
+      glm_sim <- update(
+        compact_model_glm,
+        lapse ~ .,
+        data = transform(feat, lapse = y_sim)
+      )
+      
+      # refit GLMM
+      glmer_sim <- update(
+        aug_model,
+        data = transform(feat, lapse = y_sim)
+      )
+      
+      2 * (
+        as.numeric(logLik(glmer_sim)) -
+        as.numeric(logLik(glm_sim))
+      )
+    })
+    
+    # observed LRT
+    ll_glm   <- logLik(compact_model_glm)
+    ll_glmer <- logLik(aug_model)
+    
+    lrt_obs <- 2 * (
+      as.numeric(ll_glmer) -
+      as.numeric(ll_glm)
+    )
+    
+    tibble(
+      rand_effect = str_remove(basename(file), "\\.rds$"),
+      lrt_obs = lrt_obs,
+      n_exceed = sum(lrt_boot >= lrt_obs),
+      p_boot = (sum(lrt_boot >= lrt_obs) + 1) / (B + 1)
+    )
+  }
+) |>
+  list_rbind()
+```
+
+
+
+
+
+
+
+
+
+

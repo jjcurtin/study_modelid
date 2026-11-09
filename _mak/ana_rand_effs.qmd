@@ -90,7 +90,7 @@ ids <- ids |>
 ids <- ids |>
   mutate(
     across(
-      -c(demo_sex, demo_race, auh_service),
+      -c(subid, demo_sex, demo_race, auh_service),
       ~ as.numeric(scale(.x))
     )
   ) |> 
@@ -202,6 +202,24 @@ outcome_labels <- c(
 )
 ```
 
+## EDA
+
+```{r}
+features_ids |> 
+  select(-subid, -demo_sex, -demo_race, -auh_service) |> 
+  names() |> 
+  map(\(name) plot_box_violin(df = features_ids, x = name)) |> 
+  cowplot::plot_grid(plotlist = _, ncol = 4)
+
+features_ids |> 
+  select(-subid, -demo_sex, -demo_race, -auh_service) |> 
+  skimr::skim()
+
+features_ids |> tabyl(demo_sex)
+features_ids |> tabyl(demo_race)
+features_ids |> tabyl(auh_service)
+```
+
 ## Analysis
 
 ### Data
@@ -235,7 +253,7 @@ rand_effs_distribution |>
     geom_text_repel(aes(label = variable), size = 5) +
     geom_hline(aes(yintercept = .0025), color = "blue", linetype = "dashed")
 
-plot_box_violin <- function(df, x){
+plot_box_violin2 <- function(df, x){
   
   df |>
     ggplot(aes(x = .data[[x]])) +
@@ -271,7 +289,7 @@ plot_box_violin <- function(df, x){
 random_effs_multilevel |> 
   select(-subid, -Intercept) |> 
   names() |> 
-  map(\(name) plot_box_violin(df = random_effs_multilevel, x = name)) |> 
+  map(\(name) plot_box_violin2(df = random_effs_multilevel, x = name)) |> 
   cowplot::plot_grid(plotlist = _, ncol = 4)
 
 hist(rand_effs_distribution$variance)
@@ -299,42 +317,6 @@ regressors <- rand_effs_distribution |>
   mutate(size = sd / abs(multilevel)) |> 
   filter(size > 0.25) |> 
   pull(variable)
-```
-
-**Model Comparison**
-
-
-```{r}
-full_model <- read_rds(
-  here::here(
-    format_path("risk/models/multilevel"),
-    "model_multilevel_glmer_v2.rds"
-  )
-)
-
-model_files <- list.files(
-  path = "~/Desktop/model_save/glmer",
-  pattern = "\\.rds$",
-  full.names = TRUE
-)
-
-results <- map(
-  model_files,
-  \(file) {
-    
-    message("Processing: ", basename(file))
-    
-    compact_model <- read_rds(file)
-
-    anova(full_model, compact_model, test = "LRT") |> 
-      as_tibble() |> 
-      mutate(
-        rand_effect = str_remove(basename(file), ".rds")
-      )
-    
-  }
-) |> 
-  list_rbind()
 ```
 
 

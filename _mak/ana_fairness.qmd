@@ -1,0 +1,207 @@
+---
+title: "Fairness Analysis"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+params:
+  version: "v32"
+  algorithm: "glmnet"
+  feature_set: "raw"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+- v4 & v5 in archive: old model with cut_auroc (v4 for population and v5 for multilevel)
+
+- v2 for glmer only (never did 5-fold cv for bayesian models)
+
+## Set Up
+
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+library(brms, exclude = c("populate", "mixture", "ar"))
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+path_input <- format_path("optimize/modeling/chtc")
+path_models <- format_path("optimize/modeling/models")
+path_features <-  format_path("optimize/data_processed/features")
+path_multilevel <- format_path("risk/data_processed/multilevel")
+
+# set ggplot theme to minimal
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+configs_all <-
+  read_csv(here::here(path_models,
+                      str_c("auroc_", params$version, ".csv")),
+           show_col_types = FALSE) |>
+  mutate(algorithm = params$algorithm)
+
+d <- read_csv(here::here(path_input,
+                         str_c("train_", params$version, "/input/data_trn.csv")))
+ids <- read_csv(here::here(path_multilevel, "features_ids.csv")) |> 
+  glimpse()
+```
+
+```{r}
+set.seed(03050321)
+splits_kfold <- d |>
+  vfold_cv(v = 5, repeats = 1, strata = "lapse")
+
+feat_test <- map(1:5, \(i) assessment(splits_kfold$splits[[i]]) |> mutate(fold = i)) |> 
+  list_rbind()
+```
+
+```{r}
+model_lst_population <- read_rds(here::here(format_path("risk/models/multilevel"),
+                                             "model_population_v2.rds"))
+model_lst_multilevel <- read_rds(here::here(format_path("risk/models/multilevel"),
+                                             "model_multilevel_v2.rds"))
+feat_test <- map(1:5, \(i) assessment(splits_kfold$splits[[i]]) |> mutate(fold = i)) |> 
+  list_rbind()
+```
+
+```{r}
+pred_prob_tbl_population <- read_csv(here::here(format_path("risk/models/multilevel"),
+                                "prob_out_population_v2.csv"))
+pred_prob_tbl_multilevel <- read_csv(here::here(format_path("risk/models/multilevel"),
+                                      "prob_out_multilevel_v2.csv"))
+pred_prob_tbl_multilevel_fixed <- read_csv(here::here(format_path("risk/models/multilevel"),
+                       "prob_out_fixed_multilevel_v2.csv"))
+probs <- tibble(
+  multilevel = 1 - pred_prob_tbl_multilevel$prob,
+  multilevel_fixed = 1 - pred_prob_tbl_multilevel_fixed$prob,
+  population = 1 - pred_prob_tbl_population$prob
+)
+```
+
+
+## Fairness Analysis
+
+
+```{r}
+d_fairness <- feat_test |> 
+  select(fold, subid, dttm_label, lapse) |> 
+  cbind(probs) |> 
+  left_join(ids |> select(subid, starts_with("demo")), by = "subid") |> 
+  glimpse()
+```
+
+**Sex**
+
+```{r}
+d_fairness_male <- d_fairness |> 
+  filter(demo_sex == "Male") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+d_fairness_female <- d_fairness |> 
+  filter(demo_sex == "Female") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+# check if all folds have lapses
+d_fairness_male |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+d_fairness_female |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+
+# Comparison
+fairness_sex <- full_join(
+  d_fairness_male |> 
+    group_by(fold) |> 
+    summarize(
+      male_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      male_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      male_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    ),
+  d_fairness_female |> 
+    group_by(fold) |> 
+    summarize(
+      female_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      female_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      female_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    )
+) |> 
+  mutate(diff_multilevel = male_multilevel - female_multilevel,
+         diff_multilevel_fixed = male_multilevel_fixed - female_multilevel_fixed,
+         diff_population = male_population - female_population) |> 
+  relocate(fold, diff_multilevel, diff_multilevel_fixed, diff_population) 
+
+fairness_sex
+
+fairness_sex |> skimr::skim_without_charts()
+```
+
+**Race**
+
+```{r}
+d_fairness_white <- d_fairness |> 
+  filter(demo_race == "White/Caucasian") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+d_fairness_nonwhite <- d_fairness |> 
+  filter(demo_race != "White/Caucasian") |> 
+  select(fold, subid, dttm_label, lapse, multilevel, population, multilevel_fixed)
+
+# check if all folds have lapses
+d_fairness_white |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+d_fairness_nonwhite |> 
+  group_by(fold) |> 
+  summarize(n = sum(lapse == "lapse"))
+
+# Comparison
+fairness_race <- full_join(
+  d_fairness_white |> 
+    group_by(fold) |> 
+    summarize(
+      white_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      white_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      white_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    ),
+  d_fairness_nonwhite |> 
+    group_by(fold) |> 
+    summarize(
+      nonwhite_multilevel = roc_auc_vec(truth = factor(lapse), estimate = multilevel),
+      nonwhite_multilevel_fixed = roc_auc_vec(truth = factor(lapse), estimate = multilevel_fixed),
+      nonwhite_population = roc_auc_vec(truth = factor(lapse), estimate = population)
+    )
+) |> 
+  mutate(diff_multilevel = white_multilevel - nonwhite_multilevel,
+         diff_multilevel_fixed = white_multilevel_fixed - nonwhite_multilevel_fixed,
+         diff_population = white_population - nonwhite_population) |> 
+  relocate(fold, diff_multilevel, diff_multilevel_fixed, diff_population)
+
+fairness_race
+
+fairness_race |> skimr::skim()
+```

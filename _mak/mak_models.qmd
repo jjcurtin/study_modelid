@@ -85,10 +85,15 @@ configs_all <-
   mutate(algorithm = params$algorithm)
 
 d <- read_csv(here::here(path_input,
-                         str_c("train_", params$version, "/input/data_trn.csv"))) |> 
-  mutate(lapse = factor(lapse, levels = c("no lapse", "lapse")))
+                         str_c("train_", params$version, "/input/data_trn.csv"))) 
 ```
 
+```{r}
+# source(here::here(path_input,str_c("train_", params$version, 
+#                             "/input/training_controls.R")))
+# d <- d |> 
+#   format_data()
+```
 
 ## Modeling
 
@@ -112,7 +117,7 @@ if (config$resample == "none") {
 
 
 rec <- recipe(lapse ~ ., data = d) |>
-  step_select(-dttm_label, -strat, -subid) |>
+  step_select(-strat, -subid) |>
   # step_rm(ema_1.maxraw.p24) |> 
   step_impute_median(all_numeric_predictors()) |>
   step_impute_mode(all_nominal_predictors()) |>
@@ -249,15 +254,76 @@ coeffs <- coeffs_population |>
              by = "term") |> 
   select(term, population, multilevel)
 
-coeffs |> write_csv(here::here(format_path("risk/data_processed/multilevel"),
-                       "coeffs_glmer_v2.csv"))
-random_effs_multilevel |>
-  write_csv(here::here(format_path("risk/data_processed/multilevel"),
-                       "random_effects_glmer_v2.csv"))
+# coeffs |> write_csv(here::here(format_path("risk/data_processed/multilevel"),
+#                        "coeffs_glmer_v2.csv"))
+# random_effs_multilevel |>
+#   write_csv(here::here(format_path("risk/data_processed/multilevel"),
+#                        "random_effects_glmer_v2.csv"))
 ```
 
 ## Train compact models
 
+```{r}
+glm_formula <- str_c("lapse ~ ", effects)
+model_glm <- glm(
+  formula = as.formula(glm_formula),
+  data = feat,
+  family = binomial(link = "logit")
+)
+model_glm |>  write_rds(
+  here::here(
+    format_path("risk/models/multilevel"),
+    "model_multilevel_glm_v2.rds"
+  )
+)
+
+walk(
+  names(feat |> select(-subid, -lapse)),
+  \(feat_excl) {
+    
+    feat_name <- str_replace_all(feat_excl, stringr::fixed("."), "_")
+    
+    file_path <- str_c(
+      "~/Desktop/model_save/glm/",
+      feat_name,
+      ".rds"
+    )
+    
+    if (file.exists(file_path)) {
+      message("Existing model found: ", feat_excl)
+      
+    } else {
+      
+      message("Fitting model: ", feat_excl)
+      
+      
+      brms_formula <- str_c(
+        "lapse ~ ", effects,
+        " + (1 + ", feat_excl, " | subid)"
+      )
+      
+      model_compact <- lme4::glmer(
+        formula = as.formula(brms_formula),
+        data = feat,
+        family = binomial(link = "logit"),
+        control = lme4::glmerControl(
+          optimizer = "bobyqa"
+        )
+      )
+      
+      write_rds(
+        model_compact,
+        file_path
+      )
+      
+      rm(model_compact)
+      gc()
+    }
+  }
+)
+```
+
+**each random effect removed**
 
 ```{r}
 walk(
