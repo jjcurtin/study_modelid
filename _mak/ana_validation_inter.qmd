@@ -1,0 +1,281 @@
+---
+title: "Retrain features for GLMNet model in `r params$version`"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+params:
+  version: "v32"
+  algorithm: "glmnet"
+  feature_set: "raw"
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+
+
+## Set Up
+
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+library(brms, exclude = c("populate", "mixture", "ar"))
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+path_input <- format_path("optimize/modeling/chtc")
+path_models <- format_path("optimize/modeling/models")
+path_features <-  format_path("optimize/data_processed/features")
+path_shared <- format_path("risk/data_processed/shared")
+
+# set ggplot theme to minimal
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+# model <- read_rds(here::here(path_models,
+#                                  str_c("model_best_",
+#                                        params$version, ".rds")))
+
+# coeffs <- read_csv(here::here(path_models,
+#                         str_c("coeffs_best_", 
+#                               params$version, ".csv")),
+#                        show_col_types = FALSE)
+
+configs_all <-
+  read_csv(here::here(path_models,
+                      str_c("auroc_", params$version, ".csv")),
+           show_col_types = FALSE) |>
+  mutate(algorithm = params$algorithm)
+
+d <- read_csv(here::here(path_input,
+                         str_c("train_", params$version, "/input/data_trn.csv")))
+
+```
+
+## Modeling
+
+```{r}
+set.seed(03050321)
+splits_kfold <- d |>
+  vfold_cv(v = 5, repeats = 1, strata = "lapse")
+
+# check participant distribution
+map_dfr(splits_kfold$splits, \(s) {
+  assessment(s) |>
+    summarize(n_subid_trn = n_distinct(subid)) |> 
+    cbind(
+      analysis(s) |> 
+        summarize(n_subid_test = n_distinct(subid))
+    )
+})
+
+splits_variance <- map2(
+  splits_kfold$splits,
+  seq_along(splits_kfold$splits),
+  \(s, i) {
+    assessment(s) |> 
+      tabyl(subid) |> 
+      select(subid, n) |> 
+      rename(!!paste0("split_", i) := n)
+  }
+) |> 
+  reduce(full_join, by = "subid")
+
+splits_variance |> 
+  rowwise() |>
+    mutate(
+      n_sd  = sd(c_across(starts_with("split_")))
+    ) |>
+  ungroup() |> 
+  arrange(desc(n_sd))
+```
+
+
+### Population Model
+
+```{r}
+results_tbl_population <- tibble()
+pred_prob_tbl_population <- tibble()
+model_lst_population <- list()
+reg_coeff_population <- tibble()
+
+config <- configs_all |>
+  arrange(desc(auroc)) |>
+  slice(1) |>
+  mutate(algorithm = params$algorithm)
+
+algorithm <- config$algorithm
+feature_set <- config$feature_set
+
+if (config$resample == "none") {
+  resample <- config$resample
+} else {
+  resample <- str_split(config$resample, "_")[[1]][1]
+  ratio <- as.numeric(str_split(config$resample, "_")[[1]][2])
+}
+
+
+for (i in 1:length(splits_kfold$splits)){
+  
+  split <- splits_kfold$splits[[i]]
+
+  rec <- recipe(lapse ~ ., data = analysis(split)) |>
+    step_select(-dttm_label, -strat, -subid) |>
+    # step_rm(ema_1.maxraw.p24) |> 
+    step_impute_median(all_numeric_predictors()) |>
+    step_impute_mode(all_nominal_predictors()) |>
+    themis::step_downsample(lapse, under_ratio = ratio, seed = 10) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+    step_rm(where(~ any(is.na(.)))) |> 
+    step_nzv(all_predictors())
+
+  rec_prep <- prep(rec, training = analysis(split), retain = TRUE)
+
+  feat_trn <- bake(rec_prep, new_data = NULL)
+  feat_tst <- bake(rec_prep, new_data = assessment(split))
+  
+  model_glmnet <- logistic_reg(
+    penalty = config$hp2,
+    mixture = config$hp1
+  ) |> 
+    set_engine("glmnet") |> 
+      set_mode("classification") |> 
+    fit(lapse ~ ., data = feat_trn)
+  
+  model_lst_population[[i]] <- model_glmnet
+  
+  auroc_trn <- tibble(
+    truth = factor(as.numeric(feat_trn$lapse)),
+    .pred_1 = predict(model_glmnet, feat_trn, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  auroc_tst <- tibble(
+    truth = factor(as.numeric(feat_tst$lapse)),
+    .pred_1 = predict(model_glmnet, feat_tst, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  results_tbl_population <- results_tbl_population |> 
+    rbind(tibble(
+      id = i,
+      auroc_trn = auroc_trn$.estimate,
+      auroc_tst = auroc_tst$.estimate
+    ))
+  
+  pred_prob_tbl_population <- pred_prob_tbl_population |> 
+    rbind(tibble(prob = 
+                   predict(model_glmnet, feat_tst, type = "prob")$`.pred_no lapse`))
+  
+  reg_coeff_population <- reg_coeff_population |> 
+    rbind(model_glmnet |> tidy() |> mutate(fold = i) |> relocate(fold))
+  
+}
+
+```
+
+```{r}
+# results_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+#                                 "cv_results_v4.csv"))
+# pred_prob_tbl_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+#                                 "prob_out_v4.csv"))
+# model_lst_population |> write_rds(here::here(format_path("risk/models/multilevel"),
+#                                              "model_v4.rds"))
+# reg_coeff_population |> write_csv(here::here(format_path("risk/models/multilevel"),
+#                                 "reg_coeff_v4.csv"))
+```
+
+```{r}
+results_tbl_population_inter <- tibble()
+pred_prob_tbl_population_inter <- tibble()
+model_lst_population_inter <- list()
+reg_coeff_population_inter <- tibble()
+
+for (i in 1:length(splits_kfold$splits)){
+  
+  split <- splits_kfold$splits[[i]]
+
+  rec <- recipe(lapse ~ ., data = analysis(split)) |>
+    step_select(-dttm_label, -strat, -subid) |>
+    # step_rm(ema_1.maxraw.p24) |> 
+    step_impute_median(all_numeric_predictors()) |>
+    step_impute_mode(all_nominal_predictors()) |>
+    themis::step_downsample(lapse, under_ratio = ratio, seed = 10) |>
+    step_zv(all_predictors()) |>
+    step_normalize(all_numeric_predictors()) |>
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) |> 
+    step_interact(~ dass_anx:act_type_aa.durraw.p168) |> 
+    step_rm(where(~ any(is.na(.)))) |> 
+    step_nzv(all_predictors())
+
+  rec_prep <- prep(rec, training = analysis(split), retain = TRUE)
+
+  feat_trn <- bake(rec_prep, new_data = NULL)
+  feat_tst <- bake(rec_prep, new_data = assessment(split))
+  
+  model_glmnet <- logistic_reg(
+    penalty = config$hp2,
+    mixture = config$hp1
+  ) |> 
+    set_engine("glmnet") |> 
+      set_mode("classification") |> 
+    fit(lapse ~ ., data = feat_trn)
+  
+  model_lst_population_inter[[i]] <- model_glmnet
+  
+  auroc_trn <- tibble(
+    truth = factor(as.numeric(feat_trn$lapse)),
+    .pred_1 = predict(model_glmnet, feat_trn, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  auroc_tst <- tibble(
+    truth = factor(as.numeric(feat_tst$lapse)),
+    .pred_1 = predict(model_glmnet, feat_tst, type = "prob")$.pred_lapse
+  ) |>
+    roc_auc(truth = truth, .pred_1)
+  
+  results_tbl_population_inter <- results_tbl_population_inter |> 
+    rbind(tibble(
+      id = i,
+      auroc_trn = auroc_trn$.estimate,
+      auroc_tst = auroc_tst$.estimate
+    ))
+  
+  pred_prob_tbl_population_inter <- pred_prob_tbl_population_inter |> 
+    rbind(tibble(prob = 
+                   predict(model_glmnet, feat_tst, type = "prob")$`.pred_no lapse`))
+  
+  reg_coeff_population_inter <- reg_coeff_population_inter |> 
+    rbind(model_glmnet |> tidy() |> mutate(fold = i) |> relocate(fold))
+  
+}
+
+```
+

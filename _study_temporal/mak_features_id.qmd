@@ -1,0 +1,76 @@
+---
+title: "Make Demographic and ID variables"
+author: "Coco Yu"
+date: "`r lubridate::today()`"
+format:
+  html:
+    embed-resources: true
+    toc: true 
+    toc-depth: 3
+editor_options: 
+  chunk_output_type: console
+---
+
+## Notes
+
+## Set Up
+
+```{r}
+#| message: false
+#| warning: false
+#| code-fold: true
+
+library(tidyverse)
+library(tidymodels)
+
+library(broom, include.only = "tidy")
+library(janitor, include.only = c("tabyl"))
+library(Matrix, exclude = c("expand", "pack", "unpack"))
+library(corrr)
+
+options(conflicts.policy = "depends.ok")
+
+source("https://github.com/jjcurtin/lab_support/blob/main/format_path.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/var_score.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_ml.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_eda.R?raw=true")
+source("https://github.com/jjcurtin/lab_support/blob/main/fun_plots.R?raw=true")
+# source("https://github.com/jjcurtin/lab_support/blob/main/chtc/static_files/fun_chtc.R?raw=true")
+
+path_shared <- format_path("risk2/data_processed/shared")
+
+theme_set(theme_minimal())
+
+```
+
+## Data
+
+```{r}
+demographics <- read_csv(here::here(path_shared,
+                                    "features_demographics.csv"))
+intake <- read_csv(here::here(path_shared, "survey_intake.csv"), 
+                   show_col_types = FALSE) |> 
+  filter(subid %in% demographics$subid)
+
+```
+
+## Clean up
+
+### demographics
+
+```{r}
+ids <- demographics |> 
+  select(subid, age, gender, race, income)
+
+ids |> tabyl(gender)
+ids |> tabyl(race)
+```
+
+### WHO-ASSIST
+
+```{r}
+intake |> 
+  select(subid, starts_with("whoassist")) |>
+  glimpse()
+```
+
