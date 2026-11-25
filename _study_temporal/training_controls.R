@@ -1,49 +1,5 @@
 # Training controls for EMA study
 
-# NOTES------------------------------
-# version 1: daily labels, 4x EMA, demos, 24h rolls
-# version 2: daily labels, 1x EMA, demos,  24h rolls
-# version 3: daily labels, 1x EMA, GPS data set, 24h rolls
-# version 4: daily labels, 1x EMA, GPS & demo features, 24h rolls
-# version 5: day window, 1 hr rolls, 1x EMA, GPS, & demo features
-# version 6: Added stratify (incorrectly), EMA abstinence question, monthly features 
-#            dropped transit and location variance features
-#            dropped 12 and 24 hour period features for EMA b/c using only 1x daily
-# version 7: fixed issue with stratify, removed monthly diff features, switched to 3x10
-#            increased tree depth, mtry and decreased learn rate
-# version 8: returned to 4x EMA (+ abstinence).  stratify by h/l, raw monthly, 
-#            gps (all features except transit), and demo features; 
-#            changed to simple 6x5
-# version 9: Changed to 1x EMA.  All other features the same (excepted fixed issue
-#            with GPS features for other types with spaces in names).  Changed to 5x5 CV
-#            changed mtry to 50:300 by 50
-# version 10: Restried to just 1x EMA (stratified).  Drop GPS, monthly, and demos
-# version 11: Changed to 1x EMA for 24HOUR rolls.  Included GPS, monthly.   stratified
-#             keeping all features matched to v9 for fair comparison (but did drop demos)
-# version 12: Switched to logistic.  dropped no, neutral and ema min features
-# version 13: Switched to GLMNet and back to 1 hour rolls.  Dropped no and neutral 
-#             from GPS.  Dropped min from EMA. 
-# version 14: Same features as v13 but back to XGBoost
-# version 15: repeat of v13 with correction to sample size!
-# version 16: same features as v15 but switch to xgboost.  (repeat of v14 with correct nrows)
-# version 17: fix issue with feature set selection.  Handle feature rename at this stage
-#             All else same as v15
-# version 18: drops monthly. Includes on gps, ema and strat as per previous versions
-#             also didnt run dif only model to save time.   Its not good
-# version 19: switch to one-hot codes for day of week and na/pa  
-# version 20: update feature names
-# version 21: back to 24 hour rolls.  features with and without nzv
-# version 22: put in na/pa features for 24hr rolls.  Only using rm nzc configs
-# version 23: selected down to p168 and p24/0 for gps/ema. Also not scaling binary features
-# version 24: same as 23 but with XGBoost
-# version 25: same as 24 with XGBoost but different hyperparameter options
-# version 26: back to glmnet with with lin/quad on val/arousal instead of pa/na
-# version 27: updated/corrected gps features.  remove gps type other, retain some min emas (5, PA, NA)
-# version 28: removes all min ema features again
-# version 29: recode of EMA 2-5 from 
-# version 30 really recodes... 
-# version 31: adds ema1 max in past 24 (across all emas in past 24) and removes lapse count in past 24
-# version 32: added back in short duration lapse count (now 48 rather than 24) and removed ema1 max
 
 library(stringr)
 library(dplyr)
@@ -81,11 +37,11 @@ y_level_neg <- "no lapse"
 
 
 # CV SETTINGS---------------------------------
-cv_resample_type <- "kfold" # can be boot, kfold, or nested
-cv_resample = "6_x_5" # can be repeats_x_folds (e.g., 1_x_10, 10_x_10) or number of bootstraps (e.g., 100)
-cv_inner_resample <- NULL # can also be a single number for bootstrapping (i.e., 100)
-cv_outer_resample <- NULL # outer resample will always be kfold
-cv_group <- "subid" # set to NULL if not grouping
+cv_resample_type <- "nested" # can be boot, kfold, or nested
+cv_resample = NULL # can be repeats_x_folds (e.g., 1_x_10, 10_x_10) or number of bootstraps (e.g., 100)
+cv_inner_resample <- "1_x_10" # can also be a single number for bootstrapping (i.e., 100)
+cv_outer_resample <- "3_x_10" # outer resample will always be kfold
+cv_group <- NULL # set to NULL if not grouping
 cv_strat <- TRUE 
 
 cv_name <- if_else(cv_resample_type == "nested",
